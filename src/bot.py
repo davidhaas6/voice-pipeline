@@ -109,9 +109,10 @@ class ModularDiscordBot(discord.Bot):
         if not text:
             print("[TTS] No text to speak.")
             return
-        print(f"[TTS] Speaking: {text}")
+        print(f'[TTS] Requesting speech for: "{text[:50]}..."')
 
         def on_audio_chunk(chunk_np: np.ndarray):
+            start_proc = time.perf_counter()
             # pocket_tts provides float32 mono at self.tts_manager.sample_rate
             # 1. Resample to 48000
             resampled = resample_audio(chunk_np, self.tts_manager.sample_rate, 48000)
@@ -131,11 +132,18 @@ class ModularDiscordBot(discord.Bot):
             frame_size_bytes = frame_size_samples * CHANNELS * SAMPLE_WIDTH
 
             raw_bytes = stereo_data.tobytes()
+            frames_enqueued = 0
             for i in range(0, len(raw_bytes), frame_size_bytes):
                 frame = raw_bytes[i : i + frame_size_bytes]
                 if len(frame) < frame_size_bytes:
                     frame += b"\x00" * (frame_size_bytes - len(frame))
                 context.playback_queue.put(frame)
+                frames_enqueued += 1
+
+            proc_time = (time.perf_counter() - start_proc) * 1000
+            print(
+                f"[Bot] Processed chunk: {len(chunk_np)} samples -> {frames_enqueued} frames in {proc_time:.2f}ms"
+            )
 
         self.tts_manager.speak(text, callback=on_audio_chunk)
 
@@ -143,13 +151,20 @@ class ModularDiscordBot(discord.Bot):
 
     async def run_pipeline(self, context: ServerContext, audio_data: bytes):
         """Coordinates the STT -> T2T -> TTS flow"""
+        pipeline_start = time.perf_counter()
         try:
             transcript = await self.transcribe_audio(audio_data)
+            stt_done = time.perf_counter()
+            print(f"[Pipeline] STT took {(stt_done - pipeline_start) * 1000:.2f}ms")
+
             context.chat_history.append({"role": "user", "content": transcript})
             if not transcript or not await self.decide_to_respond(transcript):
                 return
 
             response_text = await self.generate_response_text(context.chat_history)
+            t2t_done = time.perf_counter()
+            print(f"[Pipeline] T2T took {(t2t_done - stt_done) * 1000:.2f}ms")
+
             print(f"Assistant: {response_text}")
             context.chat_history.append({"role": "assistant", "content": response_text})
 
@@ -241,20 +256,30 @@ class ModularDiscordBot(discord.Bot):
         """Dedicated thread to pull frames from the queue and send to Discord every 20ms."""
         print(f"Playback worker started for guild {context.guild_id}")
 
-        while not context.stop_event.is_set():
-            start_time = time.perf_counter()
+        # Target interval in seconds
+        TARGET_INTERVAL = DISCORD_FRAME_SIZE_MS / 1000.0
+        next_frame_time = time.perf_counter()
 
+        while not context.stop_event.is_set():
+            # 1. Send frame if available
             try:
-                # Non-blocking get from queue
                 frame = context.playback_queue.get_nowait()
                 context.vc.send_audio_packet(frame, encode=True)
             except queue.Empty:
                 pass
 
-            # Precise 20ms timing
-            elapsed = time.perf_counter() - start_time
-            sleep_time = max(0, (DISCORD_FRAME_SIZE_MS / 1000) - elapsed)
-            time.sleep(sleep_time)
+            # 2. Precise timing for the next frame
+            next_frame_time += TARGET_INTERVAL
+
+            # 3. Hybrid Sleep (Sleep then Busy-Wait to fix stuttering)
+            while True:
+                now = time.perf_counter()
+                remaining = next_frame_time - now
+                if remaining <= 0:
+                    break
+                if remaining > 0.005:  # If more than 5ms left, give up CPU
+                    time.sleep(remaining - 0.003)  # Sleep slightly less than required
+                # Otherwise busy-wait for sub-millisecond precision
 
 
 # --- BOT COMMANDS ---
@@ -273,14 +298,17 @@ async def join(ctx: discord.ApplicationContext):
     sink = discord.sinks.WaveSink()
 
     # Wait for the voice client to be fully connected before recording
-    # (Fixes RecordingException: Not connected to voice channel)
     count = 0
     while not vc.is_connected() and count < 100:
         await asyncio.sleep(0.1)
         count += 1
 
     if vc.is_connected():
-        vc.start_recording(sink, lambda *args: None)
+        # Library expects a coroutine for the callback
+        async def finished_callback(sink, *args):
+            pass
+
+        vc.start_recording(sink, finished_callback)
     else:
         return await ctx.respond("Failed to connect to voice channel within timeout.")
 

@@ -3,6 +3,7 @@ import os
 import queue
 import random
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -90,13 +91,36 @@ class TTSManager:
             state = self.voices[voice]
             self.stop_event.clear()
 
+            print(f'[TTS] Generating: "{text[:50]}{"..." if len(text) > 50 else ""}"')
+            start_time = time.perf_counter()
+            first_chunk_time = None
+            chunk_count = 0
+            total_samples = 0
+
             try:
                 for chunk in self.model.generate_audio_stream(state, text):
                     if self.stop_event.is_set():
                         break
 
+                    now = time.perf_counter()
+                    if first_chunk_time is None:
+                        first_chunk_time = now
+                        print(
+                            f"[TTS] TTFB: {(first_chunk_time - start_time) * 1000:.2f}ms"
+                        )
+
                     audio_data = chunk.cpu().numpy().astype(np.float32)
+                    chunk_count += 1
+                    total_samples += len(audio_data)
+
                     callback(audio_data)
+
+                end_time = time.perf_counter()
+                if chunk_count > 0:
+                    duration = total_samples / self.sample_rate
+                    print(
+                        f"[TTS] Done. Total time: {(end_time - start_time):.2f}s | Audio duration: {duration:.2f}s | Real-time factor: {(end_time - start_time) / duration:.2f}x"
+                    )
             except Exception as e:
                 print(f"[TTS] Error during generation: {e}")
             finally:
