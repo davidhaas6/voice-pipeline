@@ -1,18 +1,20 @@
-import glob
 import os
 import queue
 import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from pocket_tts import TTSModel
 
+from .logger import get_logger
+
+logger = get_logger(__name__)
+
 
 class TTSManager:
-    def __init__(self, default_voice_path="data/voice/d_hermit.wav"):
-        # print("[TTS] Initializing model...")
+    def __init__(self, default_voice_path="data/voice/ian_mckellen.wav"):
+        # logger.debug("[TTS] Initializing model...")
         self.model = TTSModel.load_model()
         self.voices = {}
         self.sample_rate = self.model.sample_rate
@@ -23,19 +25,7 @@ class TTSManager:
         self.worker_thread = threading.Thread(target=self._worker, daemon=True)
         self.worker_thread.start()
 
-        # Add initial voices in parallel
-        voice_files = glob.glob("data/voice/*.wav")
-        voices_to_load = [
-            (os.path.basename(f).split(".")[0], f)
-            for f in voice_files
-            if os.path.basename(f).split(".")[0]
-            != os.path.basename(default_voice_path).split(".")[0]
-        ]
-        voices_to_load.append(("narrator", default_voice_path))
-        voices_to_load = list(set(voices_to_load))
-
-        with ThreadPoolExecutor() as executor:
-            list(executor.map(lambda x: self.add_voice(*x), voices_to_load))
+        self.add_voice("narrator", default_voice_path)
 
     def add_voice(self, alias: str, audio_source: str):
         """
@@ -43,10 +33,10 @@ class TTSManager:
         """
         try:
             state = self.model.get_state_for_audio_prompt(audio_source, truncate=True)
-            print(f"[TTS] Loaded voice '{alias}' from {audio_source}")
+            logger.info(f"Loaded voice '{alias}' from {audio_source}")
             self.voices[alias] = state
         except Exception as e:
-            print(f"[TTS] Failed to load voice '{alias}': {e}")
+            logger.error(f"Failed to load voice '{alias}': {e}")
 
     def speak(self, text: str, voice: str = "narrator", callback=None):
         """
@@ -71,7 +61,7 @@ class TTSManager:
 
         self.stop_event.set()
 
-        print("[TTS] Playback stopped and queue cleared.")
+        logger.info("Playback stopped and queue cleared.")
         # Reset stop event for future calls
         # Note: stop_event is cleared at the start of _worker next iteration
 
@@ -91,7 +81,8 @@ class TTSManager:
             state = self.voices[voice]
             self.stop_event.clear()
 
-            print(f'[TTS] Generating: "{text[:50]}{"..." if len(text) > 50 else ""}"')
+            logger.info(f'Generating: "{text[:50]}{"..." if len(text) > 50 else ""}"')
+            # all these are for performance logging
             start_time = time.perf_counter()
             first_chunk_time = None
             chunk_count = 0
@@ -102,27 +93,31 @@ class TTSManager:
                     if self.stop_event.is_set():
                         break
 
-                    now = time.perf_counter()
+                    now = time.perf_counter()  # for performance logging
                     if first_chunk_time is None:
                         first_chunk_time = now
-                        print(
-                            f"[TTS] TTFB: {(first_chunk_time - start_time) * 1000:.2f}ms"
+                        logger.debug(
+                            f"TTFB: {(first_chunk_time - start_time) * 1000:.2f}ms"
                         )
 
                     audio_data = chunk.cpu().numpy().astype(np.float32)
+
+                    # for performance logging
                     chunk_count += 1
                     total_samples += len(audio_data)
 
                     callback(audio_data)
 
+                # for performance logging
                 end_time = time.perf_counter()
+
                 if chunk_count > 0:
                     duration = total_samples / self.sample_rate
-                    print(
-                        f"[TTS] Done. Total time: {(end_time - start_time):.2f}s | Audio duration: {duration:.2f}s | Real-time factor: {(end_time - start_time) / duration:.2f}x"
+                    logger.info(
+                        f"Done. Total time: {(end_time - start_time):.2f}s | Audio duration: {duration:.2f}s | Real-time factor: {(end_time - start_time) / duration:.2f}x"
                     )
             except Exception as e:
-                print(f"[TTS] Error during generation: {e}")
+                logger.error(f"Error during generation: {e}")
             finally:
                 self.queue.task_done()
 
@@ -134,11 +129,14 @@ if __name__ == "__main__":
 
     voice_file = "data/narrator.wav"
     if os.path.exists(voice_file):
+        from .logger import setup_logging
+
+        setup_logging()
         manager = TTSManager(voice_file)
-        print("Speaking background...")
+        logger.info("Speaking background...")
 
         def dummy_callback(data):
-            print(f"Received chunk of size {len(data)}")
+            logger.debug(f"Received chunk of size {len(data)}")
 
         manager.speak(
             "This is a test of the background voice system.", callback=dummy_callback
@@ -148,8 +146,8 @@ if __name__ == "__main__":
             callback=dummy_callback,
         )
         time.sleep(2)
-        print("Stopping mid-speech...")
+        logger.info("Stopping mid-speech...")
         manager.stop()
         time.sleep(1)
     else:
-        print(f"Test file {voice_file} not found.")
+        logger.error(f"Test file {voice_file} not found.")

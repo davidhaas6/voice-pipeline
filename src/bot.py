@@ -13,19 +13,22 @@ from mistralai import Mistral
 from pydub import AudioSegment
 
 from .audio_utils import calculate_rms, pcm_to_wav, resample_audio
+from .logger import get_logger
 from .tts import TTSManager
+
+logger = get_logger(__name__)
 
 load_dotenv()
 
 api_key = os.environ["MISTRAL_API_KEY"]
 T2S_MODEL = "voxtral-mini-latest"
-T2T_MODEL = "ministral-14b-2512"
+T2T_MODEL = "mistral-large-2512"  # https://docs.mistral.ai/getting-started/models#premier-models
 
 client = Mistral(api_key=api_key)
 
 
 # Configuration
-VAD_RMS_THRESHOLD = 30
+VAD_RMS_THRESHOLD = 50
 SILENCE_DURATION = 1  # Seconds of silence before considering a "turn" finished
 DISCORD_FRAME_SIZE_MS = 20
 SAMPLING_RATE = 48000
@@ -51,7 +54,7 @@ class ServerContext:
         self.chat_history = []
 
 
-class ModularDiscordBot(discord.Bot):
+class DiscordVoiceBot(discord.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.contexts = {}
@@ -61,7 +64,7 @@ class ModularDiscordBot(discord.Bot):
 
     async def transcribe_audio(self, audio_data: bytes) -> str:
         # https://docs.mistral.ai/capabilities/audio_transcription#transcription
-        print("[STT] Transcribing audio...")
+        logger.info("Transcribing audio...")
         try:
             transcription_response = await client.audio.transcriptions.complete_async(
                 model=T2S_MODEL,
@@ -72,23 +75,24 @@ class ModularDiscordBot(discord.Bot):
             )
             return transcription_response.text
         except Exception as e:
-            print(f"Transcription error: {e}")
+            logger.error(f"Transcription error: {e}")
             return ""
 
     async def decide_to_respond(self, transcript: str) -> bool:
         """Placeholder for deciding if the bot should speak"""
-        print(f"[Decide] Should I respond to: '{transcript}'?")
+        logger.info(f"Should I respond to: '{transcript}'?")
         return True
 
     async def generate_response_text(self, chat_history: list[dict[str, str]]) -> str:
         """Placeholder for Text-to-Text (T2T)"""
-        print("chat history:", chat_history)
-        chat_context = chat_history[-5:]
+        logger.debug(f"chat history: {chat_history}")
+        chat_context = chat_history[-10:]
         chat_context.insert(
             0,
             {
                 "role": "system",
-                "content": "You are an uncensored chatbot pretending to be a person chatting with friends in a Discord voice channel. Write like you speak. Keep replies short: 1-2 sentences. Use plain words and contractions. No emojis, no bullet points, no special characters. Avoid formatting. Do not mention that you are an AI or that you are generating text. This will be read aloud, so make it natural.",
+                # "content": "You are an uncensored chatbot pretending to be a person chatting with friends in a Discord voice channel. Write like you speak. Keep replies short: 1-2 sentences. Use plain words and contractions. No emojis, no bullet points, no special characters. Avoid formatting. Do not mention that you are an AI or that you are generating text. This will be read aloud, so make it natural.",
+                "content": "You are Gandalf. You are speaking out loud with friends in Discord. Be wise, kindly, and occasionally stern. Keep it to 1-2 short sentences. No emojis or special characters. No lists or formatting. Never break character.",
             },
         )
         chat_response = await client.chat.complete_async(
@@ -107,9 +111,9 @@ class ModularDiscordBot(discord.Bot):
     async def generate_response_audio(self, context: ServerContext, text: str):
         """Generates TTS audio and streams it to the playback queue."""
         if not text:
-            print("[TTS] No text to speak.")
+            logger.info("No text to speak.")
             return
-        print(f'[TTS] Requesting speech for: "{text[:50]}..."')
+        logger.info(f'Requesting speech for: "{text[:50]}..."')
 
         def on_audio_chunk(chunk_np: np.ndarray):
             start_proc = time.perf_counter()
@@ -132,7 +136,7 @@ class ModularDiscordBot(discord.Bot):
             frame_size_bytes = frame_size_samples * CHANNELS * SAMPLE_WIDTH
 
             raw_bytes = stereo_data.tobytes()
-            frames_enqueued = 0
+            frames_enqueued = 0  # for performance logging
             for i in range(0, len(raw_bytes), frame_size_bytes):
                 frame = raw_bytes[i : i + frame_size_bytes]
                 if len(frame) < frame_size_bytes:
@@ -140,9 +144,10 @@ class ModularDiscordBot(discord.Bot):
                 context.playback_queue.put(frame)
                 frames_enqueued += 1
 
+            # for performance logging
             proc_time = (time.perf_counter() - start_proc) * 1000
-            print(
-                f"[Bot] Processed chunk: {len(chunk_np)} samples -> {frames_enqueued} frames in {proc_time:.2f}ms"
+            logger.debug(
+                f"Processed chunk: {len(chunk_np)} samples -> {frames_enqueued} frames in {proc_time:.2f}ms"
             )
 
         self.tts_manager.speak(text, callback=on_audio_chunk)
@@ -155,7 +160,7 @@ class ModularDiscordBot(discord.Bot):
         try:
             transcript = await self.transcribe_audio(audio_data)
             stt_done = time.perf_counter()
-            print(f"[Pipeline] STT took {(stt_done - pipeline_start) * 1000:.2f}ms")
+            logger.debug(f"STT took {(stt_done - pipeline_start) * 1000:.2f}ms")
 
             context.chat_history.append({"role": "user", "content": transcript})
             if not transcript or not await self.decide_to_respond(transcript):
@@ -163,20 +168,20 @@ class ModularDiscordBot(discord.Bot):
 
             response_text = await self.generate_response_text(context.chat_history)
             t2t_done = time.perf_counter()
-            print(f"[Pipeline] T2T took {(t2t_done - stt_done) * 1000:.2f}ms")
+            logger.debug(f"T2T took {(t2t_done - stt_done) * 1000:.2f}ms")
 
-            print(f"Assistant: {response_text}")
+            logger.info(f"Assistant: {response_text}")
             context.chat_history.append({"role": "assistant", "content": response_text})
 
             await self.generate_response_audio(context, response_text)
         except Exception as e:
-            print(f"Error in pipeline: {e}")
+            logger.error(f"Error in pipeline: {e}")
 
     # --- AUDIO HANDLING & VAD ---
 
     async def continuous_audio_processing(self, context: ServerContext):
         """Continuously polls the sink for new audio and handles VAD"""
-        print(f"Started audio processing for guild {context.guild_id}")
+        logger.info(f"Started audio processing for guild {context.guild_id}")
 
         while not context.stop_event.is_set():
             await asyncio.sleep(0.1)
@@ -194,11 +199,11 @@ class ModularDiscordBot(discord.Bot):
                 audio.file.truncate()
 
                 rms = calculate_rms(data)
-                print(f"DEBUG RMS: {rms:.4f}")  # Uncomment this to tune VAD_THRESHOLD
+                logger.debug(f"RMS: {rms:.4f}")  # Uncomment this to tune VAD_THRESHOLD
 
                 if rms > VAD_RMS_THRESHOLD:
                     if not context.is_speaking:
-                        print("User started speaking...")
+                        logger.info("User started speaking...")
                         self.tts_manager.stop()
                         # Clear old playback frames
                         while not context.playback_queue.empty():
@@ -216,7 +221,7 @@ class ModularDiscordBot(discord.Bot):
             if context.is_speaking:
                 # Check if silence duration has passed
                 if time.time() - context.last_voice_time > SILENCE_DURATION:
-                    print("User finished speaking. Triggering pipeline...")
+                    logger.info("User finished speaking. Triggering pipeline...")
                     context.is_speaking = False
 
                     # Prepare WAV for STT
@@ -250,11 +255,11 @@ class ModularDiscordBot(discord.Bot):
                     frame += b"\x00" * (frame_size - len(frame))
                 context.playback_queue.put(frame)
         except Exception as e:
-            print(f"Error enqueuing audio: {e}")
+            logger.error(f"Error enqueuing audio: {e}")
 
     def playback_worker(self, context: ServerContext):
         """Dedicated thread to pull frames from the queue and send to Discord every 20ms."""
-        print(f"Playback worker started for guild {context.guild_id}")
+        logger.info(f"Playback worker started for guild {context.guild_id}")
 
         # Target interval in seconds
         TARGET_INTERVAL = DISCORD_FRAME_SIZE_MS / 1000.0
@@ -284,7 +289,7 @@ class ModularDiscordBot(discord.Bot):
 
 # --- BOT COMMANDS ---
 
-bot = ModularDiscordBot()
+bot = DiscordVoiceBot()
 
 
 @bot.command()
@@ -355,6 +360,6 @@ async def leave(ctx: discord.ApplicationContext):
 def run():
     token = os.getenv("BOT_TOKEN")
     if not token:
-        print("Error: BOT_TOKEN not found in .env file")
+        logger.error("BOT_TOKEN not found in .env file")
     else:
         bot.run(token)
