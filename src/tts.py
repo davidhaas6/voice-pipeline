@@ -24,11 +24,15 @@ class TTSManager:
 
         # Add initial voices in parallel
         voice_files = glob.glob("data/voice/*.wav")
-        voices_to_load = [(os.path.basename(f).split(".")[0], f) for f in voice_files]
+        voices_to_load = [
+            (os.path.basename(f).split(".")[0], f)
+            for f in voice_files
+            if os.path.basename(f).split(".")[0]
+            != os.path.basename(default_voice_path).split(".")[0]
+        ]
         voices_to_load.append(("narrator", default_voice_path))
         voices_to_load = list(set(voices_to_load))
 
-        # print(f"[TTS] Loading {len(voices_to_load)} voices...")
         with ThreadPoolExecutor() as executor:
             list(executor.map(lambda x: self.add_voice(*x), voices_to_load))
 
@@ -36,9 +40,9 @@ class TTSManager:
         """
         Extracts model state for a given audio file and stores it.
         """
-        # print(f"[TTS] Loading voice '{alias}' from {audio_source}...")
         try:
             state = self.model.get_state_for_audio_prompt(audio_source, truncate=True)
+            print(f"[TTS] Loaded voice '{alias}' from {audio_source}")
             self.voices[alias] = state
         except Exception as e:
             print(f"[TTS] Failed to load voice '{alias}': {e}")
@@ -58,14 +62,12 @@ class TTSManager:
         """
         Clears the queue and signals current generation to stop.
         """
-        # Clear the queue
         while not self.queue.empty():
             try:
                 self.queue.get_nowait()
             except queue.Empty:
                 break
 
-        # Signal worker to stop current generation
         self.stop_event.set()
 
         print("[TTS] Playback stopped and queue cleared.")

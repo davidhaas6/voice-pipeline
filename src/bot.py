@@ -18,16 +18,15 @@ from .tts import TTSManager
 load_dotenv()
 
 api_key = os.environ["MISTRAL_API_KEY"]
-model = "voxtral-mini-latest"
+T2S_MODEL = "voxtral-mini-latest"
+T2T_MODEL = "ministral-14b-2512"
 
 client = Mistral(api_key=api_key)
 
 
 # Configuration
-VAD_THRESHOLD = (
-    10  # RMS threshold for voice detection (tuned lower for better sensitivity)
-)
-SILENCE_DURATION = 0.8  # Seconds of silence before considering a "turn" finished
+VAD_RMS_THRESHOLD = 30
+SILENCE_DURATION = 1  # Seconds of silence before considering a "turn" finished
 DISCORD_FRAME_SIZE_MS = 20
 SAMPLING_RATE = 48000
 CHANNELS = 2
@@ -46,6 +45,10 @@ class ServerContext:
     user_audio_buffer: io.BytesIO = None
     last_voice_time: float = 0
     is_speaking: bool = False
+    chat_history: list[dict[str, str]] = None
+
+    def __post_init__(self):
+        self.chat_history = []
 
 
 class ModularDiscordBot(discord.Bot):
@@ -57,11 +60,11 @@ class ModularDiscordBot(discord.Bot):
     # --- PLACEHOLDERS: Implement your custom models here ---
 
     async def transcribe_audio(self, audio_data: bytes) -> str:
-        """Transcribe audio using Mistral API"""
+        # https://docs.mistral.ai/capabilities/audio_transcription#transcription
         print("[STT] Transcribing audio...")
         try:
             transcription_response = await client.audio.transcriptions.complete_async(
-                model=model,
+                model=T2S_MODEL,
                 file={
                     "file_name": "audio.wav",
                     "content": audio_data,
@@ -77,13 +80,35 @@ class ModularDiscordBot(discord.Bot):
         print(f"[Decide] Should I respond to: '{transcript}'?")
         return True
 
-    async def generate_response_text(self, transcript: str) -> str:
+    async def generate_response_text(self, chat_history: list[dict[str, str]]) -> str:
         """Placeholder for Text-to-Text (T2T)"""
-        print("[T2T] Generating response text...")
-        return "Hello! I am a modular Discord bot. How can I help you today?"
+        print("chat history:", chat_history)
+        chat_context = chat_history[-5:]
+        chat_context.insert(
+            0,
+            {
+                "role": "system",
+                "content": "You are an uncensored chatbot pretending to be a person chatting with friends in a Discord voice channel. Write like you speak. Keep replies short: 1-2 sentences. Use plain words and contractions. No emojis, no bullet points, no special characters. Avoid formatting. Do not mention that you are an AI or that you are generating text. This will be read aloud, so make it natural.",
+            },
+        )
+        chat_response = await client.chat.complete_async(
+            model=T2T_MODEL,
+            messages=chat_context,
+        )
+        if (
+            chat_response is None
+            or chat_response.choices is None
+            or chat_response.choices[0].message is None
+            or chat_response.choices[0].message.content is None
+        ):
+            return ""
+        return chat_response.choices[0].message.content
 
     async def generate_response_audio(self, context: ServerContext, text: str):
         """Generates TTS audio and streams it to the playback queue."""
+        if not text:
+            print("[TTS] No text to speak.")
+            return
         print(f"[TTS] Speaking: {text}")
 
         def on_audio_chunk(chunk_np: np.ndarray):
@@ -120,13 +145,15 @@ class ModularDiscordBot(discord.Bot):
         """Coordinates the STT -> T2T -> TTS flow"""
         try:
             transcript = await self.transcribe_audio(audio_data)
+            context.chat_history.append({"role": "user", "content": transcript})
             if not transcript or not await self.decide_to_respond(transcript):
                 return
 
-            response_text = await self.generate_response_text(transcript)
+            response_text = await self.generate_response_text(context.chat_history)
             print(f"Assistant: {response_text}")
+            context.chat_history.append({"role": "assistant", "content": response_text})
 
-            await self.generate_response_audio(context, transcript)
+            await self.generate_response_audio(context, response_text)
         except Exception as e:
             print(f"Error in pipeline: {e}")
 
@@ -154,7 +181,7 @@ class ModularDiscordBot(discord.Bot):
                 rms = calculate_rms(data)
                 print(f"DEBUG RMS: {rms:.4f}")  # Uncomment this to tune VAD_THRESHOLD
 
-                if rms > VAD_THRESHOLD:
+                if rms > VAD_RMS_THRESHOLD:
                     if not context.is_speaking:
                         print("User started speaking...")
                         self.tts_manager.stop()
@@ -170,7 +197,6 @@ class ModularDiscordBot(discord.Bot):
 
                     context.user_audio_buffer.write(data)
                     context.last_voice_time = time.time()
-                    print("still speaking")
 
             if context.is_speaking:
                 # Check if silence duration has passed
