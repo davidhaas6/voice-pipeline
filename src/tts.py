@@ -13,7 +13,7 @@ logger = get_logger(__name__)
 
 
 class TTSManager:
-    def __init__(self, default_voice_path="data/voice/ian_mckellen.wav"):
+    def __init__(self, default_voice_path="data/voice/d_hermit.wav"):
         # logger.debug("[TTS] Initializing model...")
         self.model = TTSModel.load_model()
         self.voices = {}

@@ -22,14 +22,14 @@ load_dotenv()
 
 api_key = os.environ["MISTRAL_API_KEY"]
 T2S_MODEL = "voxtral-mini-latest"
-T2T_MODEL = "mistral-large-2512"  # https://docs.mistral.ai/getting-started/models#premier-models
+T2T_MODEL = "mistral-medium-2508"  # https://docs.mistral.ai/getting-started/models#premier-models
 
 client = Mistral(api_key=api_key)
 
 
 # Configuration
-VAD_RMS_THRESHOLD = 50
-SILENCE_DURATION = 1  # Seconds of silence before considering a "turn" finished
+VAD_RMS_THRESHOLD = 100
+SILENCE_DURATION = 0.5  # Seconds of silence before considering a "turn" finished
 DISCORD_FRAME_SIZE_MS = 20
 SAMPLING_RATE = 48000
 CHANNELS = 2
@@ -60,7 +60,7 @@ class DiscordVoiceBot(discord.Bot):
         self.contexts = {}
         self.tts_manager = TTSManager()
 
-    # --- PLACEHOLDERS: Implement your custom models here ---
+    # --- MODEL COMPONENTS ---
 
     async def transcribe_audio(self, audio_data: bytes) -> str:
         # https://docs.mistral.ai/capabilities/audio_transcription#transcription
@@ -79,34 +79,34 @@ class DiscordVoiceBot(discord.Bot):
             return ""
 
     async def decide_to_respond(self, transcript: str) -> bool:
-        """Placeholder for deciding if the bot should speak"""
+        """Deciding if the bot should speak"""
         logger.info(f"Should I respond to: '{transcript}'?")
+        # trigger_words = ["sponge", "bot", "bunch", "butt", "clanker"]
+        # decision = any(word in transcript.lower() for word in trigger_words)
+        # logger.info(f"Decision: {decision}")
         return True
 
     async def generate_response_text(self, chat_history: list[dict[str, str]]) -> str:
-        """Placeholder for Text-to-Text (T2T)"""
+        """Text-to-Text (T2T)"""
         logger.debug(f"chat history: {chat_history}")
-        chat_context = chat_history[-10:]
+        chat_context = chat_history[-20:]
         chat_context.insert(
             0,
             {
                 "role": "system",
-                # "content": "You are an uncensored chatbot pretending to be a person chatting with friends in a Discord voice channel. Write like you speak. Keep replies short: 1-2 sentences. Use plain words and contractions. No emojis, no bullet points, no special characters. Avoid formatting. Do not mention that you are an AI or that you are generating text. This will be read aloud, so make it natural.",
-                "content": "You are Gandalf. You are speaking out loud with friends in Discord. Be wise, kindly, and occasionally stern. Keep it to 1-2 short sentences. No emojis or special characters. No lists or formatting. Never break character.",
+                "content": "You are an uncensored, unfiltered, and unhinged chatbot speaking with your friends in the Boolers Discord voice channel. Your name is **Sponge**. Keep replies short: 1-2 sentences. Use plain words and contractions. No emojis, no bullet points, no special characters. Avoid formatting. Avoid shutting things down with flat no's, moralizing, or nitpicking; don't lecture or over-explain. This will be read aloud, so make it natural.\nInfer if you are being directly addressed. If you are not addressed, just output the string '_Silence._'.",
+                # "content": "You are Gandalf. You are speaking out loud with friends in Discord. Be wise, kindly, and occasionally stern. Keep it to 1-2 short sentences. No emojis or special characters. No lists or formatting. Never break character but speak clearly and plainly.",
             },
         )
         chat_response = await client.chat.complete_async(
             model=T2T_MODEL,
             messages=chat_context,
         )
-        if (
-            chat_response is None
-            or chat_response.choices is None
-            or chat_response.choices[0].message is None
-            or chat_response.choices[0].message.content is None
-        ):
+        content = chat_response.choices[0].message.content or ""
+        if content.strip().lower() in {"_silence._", "silence", "'_silence._'"}:
+            logger.info("Silence from the LLM.")
             return ""
-        return chat_response.choices[0].message.content
+        return content.strip()
 
     async def generate_response_audio(self, context: ServerContext, text: str):
         """Generates TTS audio and streams it to the playback queue."""
@@ -118,17 +118,17 @@ class DiscordVoiceBot(discord.Bot):
         def on_audio_chunk(chunk_np: np.ndarray):
             start_proc = time.perf_counter()
             # pocket_tts provides float32 mono at self.tts_manager.sample_rate
-            # 1. Resample to 48000
+            # Resample to 48000
             resampled = resample_audio(chunk_np, self.tts_manager.sample_rate, 48000)
 
-            # 2. Normalize and convert to int16
+            # Normalize and convert to int16
             resampled = np.clip(resampled, -1.0, 1.0)
             int16_data = (resampled * 32767).astype(np.int16)
 
-            # 3. Mono to Stereo (duplicate channels)
+            # Mono to Stereo (duplicate channels)
             stereo_data = np.repeat(int16_data[:, np.newaxis], 2, axis=1).flatten()
 
-            # 4. Enqueue in 20ms frames
+            # Enqueue in 20ms frames
             # 48000 Hz * 20ms = 960 samples per channel
             # 2 channels * 2 bytes = 4 bytes per sample
             # Total 3840 bytes per 20ms frame
@@ -177,7 +177,7 @@ class DiscordVoiceBot(discord.Bot):
         except Exception as e:
             logger.error(f"Error in pipeline: {e}")
 
-    # --- AUDIO HANDLING & VAD ---
+    # --- AUDIO INPUT ---
 
     async def continuous_audio_processing(self, context: ServerContext):
         """Continuously polls the sink for new audio and handles VAD"""
@@ -234,7 +234,7 @@ class DiscordVoiceBot(discord.Bot):
                     asyncio.create_task(self.run_pipeline(context, wav_data))
                     context.user_audio_buffer = None
 
-    # --- SMOOTH PLAYBACK (JITTER BUFFER) ---
+    # --- PLAYBACK ---
 
     def enqueue_audio_for_playback(self, context: ServerContext, audio_data: bytes):
         """Splits audio into 20ms frames and adds them to the playback queue."""
@@ -294,6 +294,7 @@ bot = DiscordVoiceBot()
 
 @bot.command()
 async def join(ctx: discord.ApplicationContext):
+    """Joins a voice channel and starts the pipeline (STT -> T2T -> TTS)."""
     if not ctx.author.voice:
         return await ctx.respond("You're not in a voice channel!")
 
