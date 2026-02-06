@@ -29,15 +29,14 @@ client = Mistral(api_key=api_key)
 
 # Configuration
 VAD_RMS_THRESHOLD = 300
-SILENCE_DURATION = 0.5  # Seconds of silence before considering a "turn" finished
+SILENCE_DURATION = 0.7  # Seconds of silence before considering a "turn" finished
 DISCORD_FRAME_SIZE_MS = 20
 SAMPLING_RATE = 48000
 CHANNELS = 2
 SAMPLE_WIDTH = 2  # 16-bit PCM
-GRACE_PERIOD = 0.8  # seconds
 
 # 48kHz * 2ch * 16-bit = 192000 bytes/sec
-MIN_TURN_SECONDS = 0.35
+MIN_TURN_SECONDS = 0.25  # timer for "is user actually talking, or is that a blip"
 MIN_TURN_BYTES = int(SAMPLING_RATE * CHANNELS * SAMPLE_WIDTH * MIN_TURN_SECONDS)
 
 
@@ -52,8 +51,8 @@ class ServerContext:
     stop_event: threading.Event
     user_audio_buffer: io.BytesIO = None
     last_voice_time: float = 0
-    is_speaking: bool = False
-    # interrupted_for_current_turn: bool = False
+    user_speaking: bool = False
+    interrupted_for_current_turn: bool = False
     chat_history: list[dict[str, str]] = None
 
     def __post_init__(self):
@@ -100,7 +99,7 @@ class DiscordVoiceBot(discord.Bot):
             0,
             {
                 "role": "system",
-                "content": "You are a chill uncensored chatbot speaking with your friends in a Discord voice channel. Your name is **Sponge**. Keep replies short: 1-2 sentences. Use plain words and contractions. No emojis, no bullet points, no special characters. Avoid formatting. No moralizing, lecturing, or over-explaining. Don't be corny or too serious. This will be read aloud, so make it natural.\nInfer if you are being directly addressed. If you are not addressed, just output the string '_Silence._'.",
+                "content": "You are a chill uncensored chatbot speaking with your friends in a Discord voice channel. Your name is **Sponge**. Keep replies short: 1-2 sentences. Use plain words and contractions. No emojis, no bullet points, no special characters. Avoid formatting. No moralizing, lecturing, or over-explaining. Don't be corny or too serious. This will be read aloud, so make it natural.\nInfer if you are being directly addressed. If you are not addressed, just output the string 'Silence'.",
                 # "content": "You are Gandalf. You are speaking out loud with friends in Discord. Be wise, kindly, and occasionally stern. Keep it to 1-2 short sentences. No emojis or special characters. No lists or formatting. Never break character but speak clearly and plainly.",
             },
         )
@@ -112,17 +111,14 @@ class DiscordVoiceBot(discord.Bot):
             )
         except Exception as e:
             logger.error(f"Error during T2T: {e}")
-            return "_Silence._"
+            return "Silence"
         content = chat_response.choices[0].message.content or ""
         return content.strip()
 
     async def generate_response_audio(self, context: ServerContext, text: str):
         """Generates TTS audio and streams it to the playback queue."""
-        if not text or text.strip().lower() in {
-            "_silence._",
-            "silence",
-            "'_silence._'",
-        }:
+        clean_text = text.strip().lower()
+        if not text or ("silence" in clean_text and len(clean_text) < 10):
             logger.info("No text to speak.")
             return
         logger.info(f'Requesting speech for: "{text[:50]}..."')
@@ -185,7 +181,7 @@ class DiscordVoiceBot(discord.Bot):
             logger.debug(f"T2T took {(t2t_done - stt_done) * 1000:.2f}ms")
 
             context.chat_history.append(
-                {"role": "assistant", "content": response_text or "_Silence._"}
+                {"role": "assistant", "content": response_text or "Silence"}
             )
 
             await self.generate_response_audio(context, response_text)
@@ -217,27 +213,36 @@ class DiscordVoiceBot(discord.Bot):
                 logger.debug(f"RMS: {rms:.4f}")  # Uncomment this to tune VAD_THRESHOLD
 
                 if rms > VAD_RMS_THRESHOLD:
-                    if not context.is_speaking:
+                    if not context.user_speaking:
                         logger.info("User started speaking...")
+                        context.user_speaking = True
+                        context.user_audio_buffer = io.BytesIO()
+                        context.interrupted_for_current_turn = (
+                            False  # reset for this turn
+                        )
+
+                    context.user_audio_buffer.write(data)
+                    context.last_voice_time = time.time()
+
+                    if (
+                        not context.interrupted_for_current_turn
+                        and context.user_audio_buffer.tell() >= MIN_TURN_BYTES
+                    ):
+                        logger.info("Sustained speech detected. Interrupting bot.")
+                        context.interrupted_for_current_turn = True
                         self.tts_manager.stop()
-                        # Clear old playback frames
                         while not context.playback_queue.empty():
                             try:
                                 context.playback_queue.get_nowait()
                             except queue.Empty:
                                 break
 
-                        context.is_speaking = True
-                        context.user_audio_buffer = io.BytesIO()
-
-                    context.user_audio_buffer.write(data)
-                    context.last_voice_time = time.time()
-
-            if context.is_speaking:
+            if context.user_speaking:
                 # Check if silence duration has passed
                 if time.time() - context.last_voice_time > SILENCE_DURATION:
                     audio_data = context.user_audio_buffer.getvalue()
-                    context.is_speaking = False
+                    context.user_speaking = False
+                    context.interrupted_for_current_turn = False  # reset
 
                     if len(audio_data) < MIN_TURN_BYTES:
                         logger.info(
