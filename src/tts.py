@@ -26,6 +26,7 @@ class TTSManager:
         self.worker_thread.start()
 
         self.add_voice("narrator", default_voice_path)
+        logger.debug("Initialized TTS")
 
     def add_voice(self, alias: str, audio_source: str):
         """

@@ -28,12 +28,13 @@ client = Mistral(api_key=api_key)
 
 
 # Configuration
-VAD_RMS_THRESHOLD = 100
+VAD_RMS_THRESHOLD = 300
 SILENCE_DURATION = 0.5  # Seconds of silence before considering a "turn" finished
 DISCORD_FRAME_SIZE_MS = 20
 SAMPLING_RATE = 48000
 CHANNELS = 2
 SAMPLE_WIDTH = 2  # 16-bit PCM
+GRACE_PERIOD = 0.8  # seconds
 
 
 @dataclass
@@ -94,23 +95,29 @@ class DiscordVoiceBot(discord.Bot):
             0,
             {
                 "role": "system",
-                "content": "You are an uncensored, unfiltered, and unhinged chatbot speaking with your friends in the Boolers Discord voice channel. Your name is **Sponge**. Keep replies short: 1-2 sentences. Use plain words and contractions. No emojis, no bullet points, no special characters. Avoid formatting. Avoid shutting things down with flat no's, moralizing, or nitpicking; don't lecture or over-explain. This will be read aloud, so make it natural.\nInfer if you are being directly addressed. If you are not addressed, just output the string '_Silence._'.",
+                "content": "You are a chill uncensored chatbot speaking with your friends in a Discord voice channel. Your name is **Sponge**. Keep replies short: 1-2 sentences. Use plain words and contractions. No emojis, no bullet points, no special characters. Avoid formatting. No moralizing, lecturing, or over-explaining. Don't be corny or too serious. This will be read aloud, so make it natural.\nInfer if you are being directly addressed. If you are not addressed, just output the string '_Silence._'.",
                 # "content": "You are Gandalf. You are speaking out loud with friends in Discord. Be wise, kindly, and occasionally stern. Keep it to 1-2 short sentences. No emojis or special characters. No lists or formatting. Never break character but speak clearly and plainly.",
             },
         )
-        chat_response = await client.chat.complete_async(
-            model=T2T_MODEL,
-            messages=chat_context,
-        )
+        try:
+            chat_response = await client.chat.complete_async(
+                model=T2T_MODEL,
+                messages=chat_context,
+                temperature=1.5,
+            )
+        except Exception as e:
+            logger.error(f"Error during T2T: {e}")
+            return "_Silence._"
         content = chat_response.choices[0].message.content or ""
-        if content.strip().lower() in {"_silence._", "silence", "'_silence._'"}:
-            logger.info("Silence from the LLM.")
-            return ""
         return content.strip()
 
     async def generate_response_audio(self, context: ServerContext, text: str):
         """Generates TTS audio and streams it to the playback queue."""
-        if not text:
+        if not text or text.strip().lower() in {
+            "_silence._",
+            "silence",
+            "'_silence._'",
+        }:
             logger.info("No text to speak.")
             return
         logger.info(f'Requesting speech for: "{text[:50]}..."')
@@ -146,9 +153,9 @@ class DiscordVoiceBot(discord.Bot):
 
             # for performance logging
             proc_time = (time.perf_counter() - start_proc) * 1000
-            logger.debug(
-                f"Processed chunk: {len(chunk_np)} samples -> {frames_enqueued} frames in {proc_time:.2f}ms"
-            )
+            # logger.debug(
+            #     f"Processed chunk: {len(chunk_np)} samples -> {frames_enqueued} frames in {proc_time:.2f}ms"
+            # )
 
         self.tts_manager.speak(text, callback=on_audio_chunk)
 
@@ -162,16 +169,19 @@ class DiscordVoiceBot(discord.Bot):
             stt_done = time.perf_counter()
             logger.debug(f"STT took {(stt_done - pipeline_start) * 1000:.2f}ms")
 
+            if not transcript:
+                return
             context.chat_history.append({"role": "user", "content": transcript})
-            if not transcript or not await self.decide_to_respond(transcript):
+            if not await self.decide_to_respond(transcript):
                 return
 
             response_text = await self.generate_response_text(context.chat_history)
             t2t_done = time.perf_counter()
             logger.debug(f"T2T took {(t2t_done - stt_done) * 1000:.2f}ms")
 
-            logger.info(f"Assistant: {response_text}")
-            context.chat_history.append({"role": "assistant", "content": response_text})
+            context.chat_history.append(
+                {"role": "assistant", "content": response_text or "_Silence._"}
+            )
 
             await self.generate_response_audio(context, response_text)
         except Exception as e:

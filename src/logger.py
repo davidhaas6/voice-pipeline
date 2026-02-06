@@ -2,6 +2,8 @@ import logging
 import os
 import sys
 
+from dotenv import load_dotenv
+
 
 def setup_logging():
     """
@@ -9,6 +11,7 @@ def setup_logging():
     Sets root logger to WARNING to avoid library noise, while
     letting 'src' and '__main__' modules log at the specified level.
     """
+    load_dotenv()
     log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
     log_level = getattr(logging, log_level_str, logging.INFO)
 
