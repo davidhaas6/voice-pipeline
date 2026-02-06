@@ -36,6 +36,10 @@ CHANNELS = 2
 SAMPLE_WIDTH = 2  # 16-bit PCM
 GRACE_PERIOD = 0.8  # seconds
 
+# 48kHz * 2ch * 16-bit = 192000 bytes/sec
+MIN_TURN_SECONDS = 0.35
+MIN_TURN_BYTES = int(SAMPLING_RATE * CHANNELS * SAMPLE_WIDTH * MIN_TURN_SECONDS)
+
 
 @dataclass
 class ServerContext:
@@ -49,6 +53,7 @@ class ServerContext:
     user_audio_buffer: io.BytesIO = None
     last_voice_time: float = 0
     is_speaking: bool = False
+    # interrupted_for_current_turn: bool = False
     chat_history: list[dict[str, str]] = None
 
     def __post_init__(self):
@@ -231,16 +236,23 @@ class DiscordVoiceBot(discord.Bot):
             if context.is_speaking:
                 # Check if silence duration has passed
                 if time.time() - context.last_voice_time > SILENCE_DURATION:
-                    logger.info("User finished speaking. Triggering pipeline...")
+                    audio_data = context.user_audio_buffer.getvalue()
                     context.is_speaking = False
 
-                    # Prepare WAV for STT
-                    audio_data = context.user_audio_buffer.getvalue()
+                    if len(audio_data) < MIN_TURN_BYTES:
+                        logger.info(
+                            f"Dropping short utterance ({len(audio_data)} bytes)."
+                        )
+                        context.user_audio_buffer = None
+                        continue
+
+                    # Consider using to_mono_16k_wav for better optimization.
+                    # will need to upload some reshape and stereo assumptions
                     wav_data = pcm_to_wav(
                         audio_data, CHANNELS, SAMPLE_WIDTH, SAMPLING_RATE
                     )
 
-                    # Run pipeline in background
+                    logger.info("User finished speaking. Triggering pipeline...")
                     asyncio.create_task(self.run_pipeline(context, wav_data))
                     context.user_audio_buffer = None
 
