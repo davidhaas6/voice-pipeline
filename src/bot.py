@@ -96,7 +96,7 @@ class DiscordVoiceBot(discord.Bot):
 
     async def generate_response_text(self, chat_history: list[dict[str, str]]) -> str:
         """Text-to-Text (T2T)"""
-        chat_context = chat_history[-10:]
+        chat_context = chat_history[-20:]
         chat_context.insert(
             0,
             {
