@@ -19,16 +19,18 @@ bot = DiscordVoiceBot()
 async def join(ctx: discord.ApplicationContext):
     """Joins a voice channel and starts the pipeline (STT -> T2T -> TTS)."""
     # TODO: refactor most of this into a function in DiscordVoiceBot
-    await ctx.defer()  # Give us time to connect and setup
+    await ctx.defer(ephemeral=True)  # Give us time to connect and setup
 
     if not ctx.author.voice:
-        return await ctx.followup.send("You're not in a voice channel!")
+        return await ctx.followup.send("You're not in a voice channel!", ephemeral=True)
 
     try:
         vc = await ctx.author.voice.channel.connect(timeout=20, reconnect=True)
     except Exception as e:
         logger.error(f"Failed to connect to voice: {e}")
-        return await ctx.followup.send("Failed to connect to your voice channel.")
+        return await ctx.followup.send(
+            "Failed to connect to your voice channel.", ephemeral=True
+        )
 
     guild_id = ctx.guild.id
 
@@ -47,7 +49,9 @@ async def join(ctx: discord.ApplicationContext):
 
         vc.start_recording(sink, finished_callback)
     else:
-        return await ctx.respond("Failed to connect to voice channel within timeout.")
+        return await ctx.respond(
+            "Failed to connect to voice channel within timeout.", ephemeral=True
+        )
 
     stop_event = threading.Event()
     playback_queue = queue.Queue()
@@ -74,7 +78,7 @@ async def join(ctx: discord.ApplicationContext):
     context.playback_thread.start()
 
     bot.contexts[guild_id] = context
-    await ctx.followup.send(f"Joined {ctx.author.voice.channel.name}!")
+    await ctx.followup.send(f"Joined {ctx.author.voice.channel.name}!", ephemeral=True)
 
 
 @bot.command()
@@ -83,7 +87,7 @@ async def leave(ctx: discord.ApplicationContext):
     guild_id = ctx.guild.id
     context = bot.contexts.get(guild_id)
     if not context:
-        return await ctx.respond("I'm not in a voice channel here.")
+        return await ctx.respond("I'm not in a voice channel here.", ephemeral=True)
 
     context.stop_event.set()
 
@@ -118,17 +122,21 @@ async def leave(ctx: discord.ApplicationContext):
         context.processing_task.cancel()
 
     del bot.contexts[guild_id]
-    await ctx.respond("Left the voice channel.")
+    await ctx.respond("Left the voice channel.", ephemeral=True)
 
 
 @bot.command()
 async def system(ctx: discord.ApplicationContext, new_prompt: str = None):
     """Updates or views the bot's system prompt."""
     if new_prompt is None:
-        await ctx.respond(f"Current system prompt: ```{bot.system_prompt}```")
+        await ctx.respond(
+            f"Current system prompt: ```{bot.system_prompt}```", ephemeral=True
+        )
     else:
         bot.system_prompt = new_prompt
-        await ctx.respond(f"System prompt updated to: ```{new_prompt}```")
+        await ctx.respond(
+            f"System prompt updated to: ```{new_prompt}```", ephemeral=True
+        )
 
 
 @bot.command()
@@ -137,9 +145,9 @@ async def clear(ctx: discord.ApplicationContext):
     guild_id = ctx.guild.id
     context = bot.contexts.get(guild_id)
     if not context:
-        return await ctx.respond("I'm not in a voice channel here.")
+        return await ctx.respond("I'm not in a voice channel here.", ephemeral=True)
     context.chat_history.clear()
-    await ctx.respond("Chat history cleared.")
+    await ctx.respond("Chat history cleared.", ephemeral=True)
 
 
 @bot.event
@@ -163,7 +171,7 @@ async def status(ctx: discord.ApplicationContext):
     context = bot.contexts.get(guild_id)
 
     if not context:
-        return await ctx.respond("Not active in this server.")
+        return await ctx.respond("Not active in this server.", ephemeral=True)
 
     playback_alive = context.playback_thread and context.playback_thread.is_alive()
     queue_size = context.playback_queue.qsize()
@@ -179,7 +187,7 @@ VAD Threshold: {VAD_RMS_THRESHOLD}
 Chat History: {len(context.chat_history)}/50 messages
 """
 
-    await ctx.respond(status_msg)
+    await ctx.respond(status_msg, ephemeral=True)
 
 
 def run():
