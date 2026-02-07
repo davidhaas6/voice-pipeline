@@ -32,7 +32,8 @@ client = Mistral(api_key=api_key)
 
 # Configuration
 VAD_RMS_THRESHOLD = 300
-SILENCE_DURATION = 0.7  # Seconds of silence before considering a "turn" finished
+VAD_RMS_CONTINUE_THRESHOLD = 100
+SILENCE_DURATION = 1.2  # Seconds of silence before considering a "turn" finished
 DISCORD_FRAME_SIZE_MS = 20
 SAMPLING_RATE = 48000
 CHANNELS = 2
@@ -219,7 +220,12 @@ If you're not part of the conversation or have nothing worth saying, output 'Sil
                 rms = calculate_rms(data)
                 logger.debug(f"RMS: {rms:.4f}")  # Uncomment this to tune VAD_THRESHOLD
 
-                if rms > VAD_RMS_THRESHOLD:
+                threshold = (
+                    VAD_RMS_CONTINUE_THRESHOLD
+                    if context.user_speaking
+                    else VAD_RMS_THRESHOLD
+                )
+                if rms > threshold:
                     if not context.user_speaking:
                         logger.info("User started speaking...")
                         context.user_speaking = True
