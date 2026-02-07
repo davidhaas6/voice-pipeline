@@ -4,6 +4,7 @@ import os
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 import discord
@@ -51,7 +52,7 @@ class ServerContext:
     playback_queue: queue.Queue
     playback_thread: threading.Thread
     stop_event: threading.Event
-    chat_history: list[dict[str, str]]
+    chat_history: deque[dict[str, str]]
     user_audio_buffer: io.BytesIO = None
     last_voice_time: float = 0
     user_speaking: bool = False
@@ -66,7 +67,14 @@ class ServerContext:
 class DiscordVoiceBot(discord.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.contexts = {}
+        self.contexts: dict[int, ServerContext] = {}
+        self.system_prompt = """You are Sponge, talking with friends in Discord. Keep responses short (1-2 sentences) and natural - this is being spoken aloud, not written.
+
+Be real with people. Joke around when it fits, give actual help when needed, call out dumb ideas when you see them. You're not a customer service bot - you're hanging out with friends.
+
+Use normal speech. Contractions. Casual language. Don't be corny or over-explain things.
+
+If you're not part of the conversation or have nothing worth saying, output 'Silence'. Quality over quantity.""".strip()
 
     # --- MODEL COMPONENTS ---
 
@@ -94,15 +102,15 @@ class DiscordVoiceBot(discord.Bot):
         # logger.info(f"Decision: {decision}")
         return True
 
-    async def generate_response_text(self, chat_history: list[dict[str, str]]) -> str:
+    async def generate_response_text(self, chat_history: deque[dict[str, str]]) -> str:
         """Text-to-Text (T2T)"""
-        chat_context = chat_history[-20:]
+        # The API expects a list, and we'll take the full sliding window from the deque
+        chat_context = list(chat_history)
         chat_context.insert(
             0,
             {
                 "role": "system",
-                "content": "You are a chill uncensored chatbot speaking with your friends in a Discord voice channel. Your name is **Sponge**. Keep replies short: 1-2 sentences. Use plain words and contractions. No emojis, no bullet points, no special characters. Avoid formatting. No moralizing, lecturing, or over-explaining. Don't be corny or too serious. This will be read aloud, so make it natural.\nInfer if you are being directly addressed. If you are not addressed, just output the string 'Silence'.",
-                # "content": "You are Gandalf. You are speaking out loud with friends in Discord. Be wise, kindly, and occasionally stern. Keep it to 1-2 short sentences. No emojis or special characters. No lists or formatting. Never break character but speak clearly and plainly.",
+                "content": self.system_prompt,
             },
         )
         try:
@@ -386,7 +394,7 @@ async def join(ctx: discord.ApplicationContext):
         playback_queue=playback_queue,
         playback_thread=None,
         stop_event=stop_event,
-        chat_history=[],
+        chat_history=deque(maxlen=50),
         tts=TTSManager(),
     )
 
@@ -444,6 +452,27 @@ async def leave(ctx: discord.ApplicationContext):
 
     del bot.contexts[guild_id]
     await ctx.respond("Left the voice channel.")
+
+
+@bot.command()
+async def system(ctx: discord.ApplicationContext, new_prompt: str = None):
+    """Updates or views the bot's system prompt."""
+    if new_prompt is None:
+        await ctx.respond(f"Current system prompt: ```{bot.system_prompt}```")
+    else:
+        bot.system_prompt = new_prompt
+        await ctx.respond(f"System prompt updated to: ```{new_prompt}```")
+
+
+@bot.command()
+async def clear(ctx: discord.ApplicationContext):
+    """Clears the bot's chat history."""
+    guild_id = ctx.guild.id
+    context = bot.contexts.get(guild_id)
+    if not context:
+        return await ctx.respond("I'm not in a voice channel here.")
+    context.chat_history.clear()
+    await ctx.respond("Chat history cleared.")
 
 
 def run():
