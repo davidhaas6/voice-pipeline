@@ -57,6 +57,7 @@ class ServerContext:
     user_speaking: bool = False
     interrupted_for_current_turn: bool = False
     pipeline_lock: asyncio.Lock = None
+    tts: TTSManager = None
 
     def __post_init__(self):
         self.pipeline_lock = asyncio.Lock()
@@ -66,7 +67,6 @@ class DiscordVoiceBot(discord.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.contexts = {}
-        self.tts_manager = TTSManager()
 
     # --- MODEL COMPONENTS ---
 
@@ -127,11 +127,9 @@ class DiscordVoiceBot(discord.Bot):
 
         def on_audio_chunk(chunk_np: np.ndarray):
             start_proc = time.perf_counter()
-            # pocket_tts provides float32 mono at self.tts_manager.sample_rate
+            # pocket_tts provides float32 mono at tts.sample_rate
             # Resample to 48000
-            resampled = resample_audio_poly(
-                chunk_np, self.tts_manager.sample_rate, 48000
-            )
+            resampled = resample_audio_poly(chunk_np, context.tts.sample_rate, 48000)
 
             # Normalize and convert to int16
             resampled = np.clip(resampled, -1.0, 1.0)
@@ -162,7 +160,7 @@ class DiscordVoiceBot(discord.Bot):
             #     f"Processed chunk: {len(chunk_np)} samples -> {frames_enqueued} frames in {proc_time:.2f}ms"
             # )
 
-        self.tts_manager.speak(text, callback=on_audio_chunk)
+        context.tts.speak(text, callback=on_audio_chunk)
 
     # --- PIPELINE ORCHESTRATION ---
 
@@ -231,7 +229,7 @@ class DiscordVoiceBot(discord.Bot):
                     ):
                         logger.info("Sustained speech detected. Interrupting bot.")
                         context.interrupted_for_current_turn = True
-                        self.tts_manager.stop()
+                        context.tts.stop()
                         while not context.playback_queue.empty():
                             try:
                                 context.playback_queue.get_nowait()
@@ -347,10 +345,17 @@ bot = DiscordVoiceBot()
 @bot.command()
 async def join(ctx: discord.ApplicationContext):
     """Joins a voice channel and starts the pipeline (STT -> T2T -> TTS)."""
-    if not ctx.author.voice:
-        return await ctx.respond("You're not in a voice channel!")
+    await ctx.defer()  # Give us time to connect and setup
 
-    vc = await ctx.author.voice.channel.connect()
+    if not ctx.author.voice:
+        return await ctx.followup.send("You're not in a voice channel!")
+
+    try:
+        vc = await ctx.author.voice.channel.connect(timeout=20, reconnect=True)
+    except Exception as e:
+        logger.error(f"Failed to connect to voice: {e}")
+        return await ctx.followup.send("Failed to connect to your voice channel.")
+
     guild_id = ctx.guild.id
 
     sink = discord.sinks.WaveSink()
@@ -382,6 +387,7 @@ async def join(ctx: discord.ApplicationContext):
         playback_thread=None,
         stop_event=stop_event,
         chat_history=[],
+        tts=TTSManager(),
     )
 
     # Start background threads/tasks
@@ -394,7 +400,7 @@ async def join(ctx: discord.ApplicationContext):
     context.playback_thread.start()
 
     bot.contexts[guild_id] = context
-    await ctx.respond(f"Joined {ctx.author.voice.channel.name}!")
+    await ctx.followup.send(f"Joined {ctx.author.voice.channel.name}!")
 
 
 @bot.command()
@@ -407,7 +413,7 @@ async def leave(ctx: discord.ApplicationContext):
     context.stop_event.set()
 
     try:
-        bot.tts_manager.stop()
+        context.tts.stop()
     except Exception:
         pass
 
@@ -450,10 +456,12 @@ def run():
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt: shutting down...")
         finally:
-            # best-effort: stop TTS so threads don't keep working
             try:
-                bot.tts_manager.stop()
                 for context in bot.contexts.values():
+                    try:
+                        context.tts.stop()
+                    except Exception:
+                        pass
                     context.stop_event.set()
                     if context.playback_thread and context.playback_thread.is_alive():
                         context.playback_thread.join(timeout=1.0)

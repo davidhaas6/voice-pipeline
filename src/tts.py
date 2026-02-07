@@ -13,9 +13,19 @@ logger = get_logger(__name__)
 
 
 class TTSManager:
+    _model = None  # Class-level shared model
+
+    @staticmethod
+    def preload():
+        """Pre-loads the shared TTS model into memory."""
+        if TTSManager._model is None:
+            logger.info("[TTS] Pre-loading shared model...")
+            TTSManager._model = TTSModel.load_model()
+        return TTSManager._model
+
     def __init__(self, default_voice_path="data/voice/d_hermit.wav"):
-        # logger.debug("[TTS] Initializing model...")
-        self.model = TTSModel.load_model()
+        # Ensure model is loaded (either via preload or first init)
+        self.model = TTSManager.preload()
         self.voices = {}
         self.sample_rate = self.model.sample_rate
 
