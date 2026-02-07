@@ -12,7 +12,9 @@ from dotenv import load_dotenv
 from mistralai import Mistral
 from pydub import AudioSegment
 
-from .audio_utils import calculate_rms, pcm_to_wav, resample_audio
+from src.audio_utils import resample_audio_poly
+
+from .audio_utils import calculate_rms, pcm_to_wav
 from .logger import get_logger
 from .tts import TTSManager
 
@@ -49,14 +51,15 @@ class ServerContext:
     playback_queue: queue.Queue
     playback_thread: threading.Thread
     stop_event: threading.Event
+    chat_history: list[dict[str, str]]
     user_audio_buffer: io.BytesIO = None
     last_voice_time: float = 0
     user_speaking: bool = False
     interrupted_for_current_turn: bool = False
-    chat_history: list[dict[str, str]] = None
+    pipeline_lock: asyncio.Lock = None
 
     def __post_init__(self):
-        self.chat_history = []
+        self.pipeline_lock = asyncio.Lock()
 
 
 class DiscordVoiceBot(discord.Bot):
@@ -93,8 +96,7 @@ class DiscordVoiceBot(discord.Bot):
 
     async def generate_response_text(self, chat_history: list[dict[str, str]]) -> str:
         """Text-to-Text (T2T)"""
-        logger.debug(f"chat history: {chat_history}")
-        chat_context = chat_history[-20:]
+        chat_context = chat_history[-10:]
         chat_context.insert(
             0,
             {
@@ -121,13 +123,15 @@ class DiscordVoiceBot(discord.Bot):
         if not text or ("silence" in clean_text and len(clean_text) < 10):
             logger.info("No text to speak.")
             return
-        logger.info(f'Requesting speech for: "{text[:50]}..."')
+        logger.debug(f'Requesting speech for: "{text[:20]}..."')
 
         def on_audio_chunk(chunk_np: np.ndarray):
             start_proc = time.perf_counter()
             # pocket_tts provides float32 mono at self.tts_manager.sample_rate
             # Resample to 48000
-            resampled = resample_audio(chunk_np, self.tts_manager.sample_rate, 48000)
+            resampled = resample_audio_poly(
+                chunk_np, self.tts_manager.sample_rate, 48000
+            )
 
             # Normalize and convert to int16
             resampled = np.clip(resampled, -1.0, 1.0)
@@ -164,29 +168,30 @@ class DiscordVoiceBot(discord.Bot):
 
     async def run_pipeline(self, context: ServerContext, audio_data: bytes):
         """Coordinates the STT -> T2T -> TTS flow"""
-        pipeline_start = time.perf_counter()
-        try:
-            transcript = await self.transcribe_audio(audio_data)
-            stt_done = time.perf_counter()
-            logger.debug(f"STT took {(stt_done - pipeline_start) * 1000:.2f}ms")
+        async with context.pipeline_lock:
+            pipeline_start = time.perf_counter()
+            try:
+                transcript = await self.transcribe_audio(audio_data)
+                stt_done = time.perf_counter()
+                logger.debug(f"STT took {(stt_done - pipeline_start) * 1000:.2f}ms")
 
-            if not transcript:
-                return
-            context.chat_history.append({"role": "user", "content": transcript})
-            if not await self.decide_to_respond(transcript):
-                return
+                if not transcript:
+                    return
+                context.chat_history.append({"role": "user", "content": transcript})
+                if not await self.decide_to_respond(transcript):
+                    return
 
-            response_text = await self.generate_response_text(context.chat_history)
-            t2t_done = time.perf_counter()
-            logger.debug(f"T2T took {(t2t_done - stt_done) * 1000:.2f}ms")
+                response_text = await self.generate_response_text(context.chat_history)
+                t2t_done = time.perf_counter()
+                logger.debug(f"T2T took {(t2t_done - stt_done) * 1000:.2f}ms")
 
-            context.chat_history.append(
-                {"role": "assistant", "content": response_text or "Silence"}
-            )
+                context.chat_history.append(
+                    {"role": "assistant", "content": response_text or "Silence"}
+                )
 
-            await self.generate_response_audio(context, response_text)
-        except Exception as e:
-            logger.error(f"Error in pipeline: {e}")
+                await self.generate_response_audio(context, response_text)
+            except Exception as e:
+                logger.error(f"Error in pipeline: {e}")
 
     # --- AUDIO INPUT ---
 
@@ -197,15 +202,11 @@ class DiscordVoiceBot(discord.Bot):
         while not context.stop_event.is_set():
             await asyncio.sleep(0.1)
 
-            # Get audio from all users in the sink
-            # For simplicity, we'll just look at the first active user's audio
-            # A more robust version would mix all users.
             for user_id, audio in list(context.audio_sink.audio_data.items()):
-                if audio.file.tell() == 0:
-                    continue
-
                 audio.file.seek(0)
                 data = audio.file.read()
+                if not data:
+                    continue
                 audio.file.seek(0)
                 audio.file.truncate()
 
@@ -285,33 +286,57 @@ class DiscordVoiceBot(discord.Bot):
             logger.error(f"Error enqueuing audio: {e}")
 
     def playback_worker(self, context: ServerContext):
-        """Dedicated thread to pull frames from the queue and send to Discord every 20ms."""
         logger.info(f"Playback worker started for guild {context.guild_id}")
 
-        # Target interval in seconds
         TARGET_INTERVAL = DISCORD_FRAME_SIZE_MS / 1000.0
         next_frame_time = time.perf_counter()
 
         while not context.stop_event.is_set():
-            # 1. Send frame if available
+            # If we got disconnected, bail fast
+            if not context.vc or not context.vc.is_connected():
+                break
+
+            now = time.perf_counter()
+
+            # If we're very late (e.g. stalled for 100ms+), resync instead of trying to catch up
+            if now - next_frame_time > 0.1:
+                next_frame_time = now
+
+            sent = False
             try:
                 frame = context.playback_queue.get_nowait()
-                context.vc.send_audio_packet(frame, encode=True)
             except queue.Empty:
-                pass
+                frame = None
 
-            # 2. Precise timing for the next frame
-            next_frame_time += TARGET_INTERVAL
+            if frame is not None:
+                try:
+                    context.vc.send_audio_packet(frame, encode=True)
+                    sent = True
+                except OSError:
+                    # Socket already closed (WinError 10038) or similar: exit thread quietly
+                    break
+                except Exception:
+                    break
 
-            # 3. Hybrid Sleep (Sleep then Busy-Wait to fix stuttering)
+            if sent:
+                # Only advance schedule when we actually sent audio.
+                next_frame_time += TARGET_INTERVAL
+            else:
+                # No audio to send: don't march time forward forever.
+                # Resync so the next real frame doesn't trigger catch-up jitter.
+                next_frame_time = now + TARGET_INTERVAL
+
+            # Hybrid sleep (your original idea), but safe
             while True:
                 now = time.perf_counter()
                 remaining = next_frame_time - now
                 if remaining <= 0:
                     break
-                if remaining > 0.005:  # If more than 5ms left, give up CPU
-                    time.sleep(remaining - 0.003)  # Sleep slightly less than required
-                # Otherwise busy-wait for sub-millisecond precision
+                if context.stop_event.is_set():
+                    return
+                if remaining > 0.005:
+                    time.sleep(remaining - 0.003)
+                # else busy-wait for sub-ms precision
 
 
 # --- BOT COMMANDS ---
@@ -356,6 +381,7 @@ async def join(ctx: discord.ApplicationContext):
         playback_queue=playback_queue,
         playback_thread=None,
         stop_event=stop_event,
+        chat_history=[],
     )
 
     # Start background threads/tasks
@@ -374,15 +400,44 @@ async def join(ctx: discord.ApplicationContext):
 @bot.command()
 async def leave(ctx: discord.ApplicationContext):
     guild_id = ctx.guild.id
-    if guild_id in bot.contexts:
-        context = bot.contexts[guild_id]
-        context.stop_event.set()
+    context = bot.contexts.get(guild_id)
+    if not context:
+        return await ctx.respond("I'm not in a voice channel here.")
+
+    context.stop_event.set()
+
+    try:
+        bot.tts_manager.stop()
+    except Exception:
+        pass
+
+    while not context.playback_queue.empty():
+        try:
+            context.playback_queue.get_nowait()
+        except queue.Empty:
+            break
+
+    # stops playback thread sending before disconnect closes the socket
+    if context.playback_thread and context.playback_thread.is_alive():
+        context.playback_thread.join(timeout=1.0)
+
+    # stop recording
+    try:
+        if context.vc and context.vc.is_connected():
+            context.vc.stop_recording()
+    except Exception:
+        pass
+
+    try:
         await context.vc.disconnect()
+    except Exception:
+        pass
+
+    if context.processing_task:
         context.processing_task.cancel()
-        del bot.contexts[guild_id]
-        await ctx.respond("Left the voice channel.")
-    else:
-        await ctx.respond("I'm not in a voice channel here.")
+
+    del bot.contexts[guild_id]
+    await ctx.respond("Left the voice channel.")
 
 
 def run():
@@ -390,4 +445,19 @@ def run():
     if not token:
         logger.error("BOT_TOKEN not found in .env file")
     else:
-        bot.run(token)
+        try:
+            bot.run(token)
+        except KeyboardInterrupt:
+            logger.info("KeyboardInterrupt: shutting down...")
+        finally:
+            # best-effort: stop TTS so threads don't keep working
+            try:
+                bot.tts_manager.stop()
+                for context in bot.contexts.values():
+                    context.stop_event.set()
+                    if context.playback_thread and context.playback_thread.is_alive():
+                        context.playback_thread.join(timeout=1.0)
+                    if context.processing_task:
+                        context.processing_task.cancel()
+            except Exception:
+                pass

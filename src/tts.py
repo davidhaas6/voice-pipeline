@@ -82,7 +82,7 @@ class TTSManager:
             state = self.voices[voice]
             self.stop_event.clear()
 
-            logger.info(f'Generating: "{text[:50]}{"..." if len(text) > 50 else ""}"')
+            logger.info(f'Generating: "{text[:20]}{"..." if len(text) > 20 else ""}"')
             # all these are for performance logging
             start_time = time.perf_counter()
             first_chunk_time = None
@@ -115,7 +115,7 @@ class TTSManager:
                 if chunk_count > 0:
                     duration = total_samples / self.sample_rate
                     logger.info(
-                        f"Done. Total time: {(end_time - start_time):.2f}s | Audio duration: {duration:.2f}s | Real-time factor: {(end_time - start_time) / duration:.2f}x"
+                        f"Done. Total time: {(end_time - start_time):.2f}s | Audio duration: {duration:.2f}s | Real-time factor: {duration / (end_time - start_time):.2f}x"
                     )
             except Exception as e:
                 logger.error(f"Error during generation: {e}")

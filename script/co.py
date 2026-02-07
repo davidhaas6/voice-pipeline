@@ -52,6 +52,7 @@ DEFAULT_EXCLUDED_DIRS = {
     ".next",
     ".cache",
     ".DS_Store",
+    "script",
 }
 
 DEFAULT_INCLUDED_EXTS = {

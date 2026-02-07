@@ -1,8 +1,9 @@
 import io
+import math
 import wave
 
 import numpy as np
-from scipy.signal import resample
+from scipy.signal import resample, resample_poly
 
 
 def calculate_rms(audio_bytes: bytes) -> float:
@@ -94,3 +95,13 @@ def resample_audio(
         return audio_array
     num_samples = int(len(audio_array) * (target_rate / original_rate))
     return resample(audio_array, num_samples)
+
+
+def resample_audio_poly(x: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """good for float32 audio"""
+    if orig_sr == target_sr:
+        return x
+    g = math.gcd(orig_sr, target_sr)
+    up = target_sr // g
+    down = orig_sr // g
+    return resample_poly(x, up, down).astype(np.float32)
