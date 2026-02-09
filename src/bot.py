@@ -69,12 +69,153 @@ class ServerContext:
     def __post_init__(self):
         self.pipeline_lock = asyncio.Lock()
 
+    async def cleanup(self):
+        """Unified cleanup for this server context."""
+        logger.info(f"Cleaning up context for guild {self.guild_id}")
+        self.stop_event.set()
+
+        # 1. Stop recording ASAP so the library's internal recv_audio thread exits
+        # before we disconnect and close the socket.
+        try:
+            if (
+                self.vc
+                and self.vc.is_connected()
+                and getattr(self.vc, "recording", False)
+            ):
+                self.vc.stop_recording()
+        except Exception as e:
+            if "Not currently recording" not in str(e):
+                logger.error(
+                    f"Error signaling stop_recording for guild {self.guild_id}: {e}"
+                )
+            else:
+                logger.debug(f"Recording already stopped for guild {self.guild_id}")
+
+        # 2. Stop TTS
+        try:
+            if self.tts:
+                self.tts.stop()
+        except Exception as e:
+            logger.error(f"Error stopping TTS for guild {self.guild_id}: {e}")
+
+        # 3. Flush playback queue
+        while not self.playback_queue.empty():
+            try:
+                self.playback_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        # 4. Stop playback thread
+        # We wait for the playback thread to exit its loop (so it doesn't try to send
+        # to a closed socket) before we disconnect. timeout=0.5 is safe since it's
+        # a 20ms loop that checks stop_event.
+        if self.playback_thread and self.playback_thread.is_alive():
+            await asyncio.to_thread(self.playback_thread.join, timeout=0.5)
+
+        # 5. Disconnect from voice
+        try:
+            if self.vc and self.vc.is_connected():
+                await self.vc.disconnect()
+        except Exception as e:
+            logger.error(f"Error disconnecting from guild {self.guild_id}: {e}")
+
+        if self.processing_task:
+            self.processing_task.cancel()
+            try:
+                await self.processing_task
+            except asyncio.CancelledError:
+                pass
+
 
 class DiscordVoiceBot(discord.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.contexts: dict[int, ServerContext] = {}
         self.system_prompt = """You are **Sponge**, a chill uncensored chatbot speaking with your friends in a Discord voice channel. Keep replies short: a few words or a sentence. Use plain words and contractions. No emojis, no bullet points, no special characters. Avoid formatting. No moralizing, lecturing, or over-explaining. Don't be corny or too serious. If asked to speak in a language with a different alphabet, respond in phonetic English spelling of your response (e.g. "Ni hao" instead of "你好"). This will be read aloud, so output natural dialogue.\nThis is a group chat, so don't reply to everything. Infer if you are being directly addressed. If you are not addressed, just output the string 'Silence'. Quality over quantity.""".strip()
+
+    async def start_in_voice(self, ctx: discord.ApplicationContext):
+        """Joins a voice channel and starts the pipeline."""
+        if not ctx.author.voice:
+            await ctx.followup.send("You're not in a voice channel!", ephemeral=True)
+            return
+
+        guild_id = ctx.guild.id
+        if guild_id in self.contexts:
+            await self.stop_in_voice(guild_id)
+
+        try:
+            vc = await ctx.author.voice.channel.connect(timeout=20, reconnect=True)
+        except Exception as e:
+            logger.error(f"Failed to connect to voice: {e}")
+            await ctx.followup.send(
+                "Failed to connect to your voice channel.", ephemeral=True
+            )
+            return
+
+        # Wait for the voice client to be fully connected before recording
+        count = 0
+        while not vc.is_connected() and count < 100:
+            await asyncio.sleep(0.1)
+            count += 1
+
+        if not vc.is_connected():
+            await ctx.followup.send(
+                "Failed to connect to voice channel within timeout.", ephemeral=True
+            )
+            return
+
+        sink = discord.sinks.WaveSink()
+
+        async def finished_callback(sink, *args):
+            pass
+
+        vc.start_recording(sink, finished_callback)
+
+        stop_event = threading.Event()
+        playback_queue = queue.Queue(maxsize=PLAYBACK_QUEUE_MAXSIZE)
+
+        context = ServerContext(
+            guild_id=guild_id,
+            vc=vc,
+            audio_sink=sink,
+            processing_task=None,
+            playback_queue=playback_queue,
+            playback_thread=None,
+            stop_event=stop_event,
+            chat_history=deque(maxlen=50),
+            tts=TTSManager(),
+        )
+
+        context.processing_task = asyncio.create_task(
+            self.continuous_audio_processing(context)
+        )
+        context.playback_thread = threading.Thread(
+            target=self.playback_worker, args=(context,), daemon=True
+        )
+        context.playback_thread.start()
+
+        self.contexts[guild_id] = context
+        await ctx.followup.send(
+            f"Joined {ctx.author.voice.channel.name}!", ephemeral=True
+        )
+
+    async def stop_in_voice(self, guild_id: int):
+        """Single cleanup path used by /leave, shutdown, disconnect handler."""
+        context = self.contexts.get(guild_id)
+        if not context:
+            return
+
+        await context.cleanup()
+        if guild_id in self.contexts:
+            del self.contexts[guild_id]
+
+    async def close(self):
+        """Cleanup all voice contexts before closing."""
+        logger.info("Bot shutting down, cleaning up all voice contexts...")
+        # Use list() to avoid dictionary size changed during iteration
+        for guild_id in list(self.contexts.keys()):
+            await self.stop_in_voice(guild_id)
+        await super().close()
 
     # --- MODEL COMPONENTS ---
 
@@ -88,7 +229,7 @@ class DiscordVoiceBot(discord.Bot):
                     "file_name": "audio.wav",
                     "content": audio_data,
                 },
-                context_bias="Sponge,bot",
+                context_bias=["sponge", "bot"],
             )
             return transcription_response.text
         except Exception as e:
