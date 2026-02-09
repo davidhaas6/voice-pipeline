@@ -52,7 +52,7 @@ async def clear(ctx: discord.ApplicationContext):
     context = bot.contexts.get(guild_id)
     if not context:
         return await ctx.respond("I'm not in a voice channel here.", ephemeral=True)
-    context.chat_history.clear()
+    context.chat.history.clear()
     await ctx.respond("Chat history cleared.", ephemeral=True)
 
 
@@ -75,10 +75,10 @@ async def status(ctx: discord.ApplicationContext):
     if not context:
         return await ctx.respond("Not active in this server.", ephemeral=True)
 
-    playback_alive = context.playback_thread and context.playback_thread.is_alive()
-    queue_size = context.playback_queue.qsize()
-    vc_connected = context.vc and context.vc.is_connected()
-    speaking = "🎤 User speaking" if context.user_speaking else "🔇 Silent"
+    playback_alive = context.playback.thread and context.playback.thread.is_alive()
+    queue_size = context.playback.queue.qsize()
+    vc_connected = context.voice.vc and context.voice.vc.is_connected()
+    speaking = "🎤 User speaking" if context.turn.user_speaking else "🔇 Silent"
 
     status_msg = f"""**Bot Status**
 Voice: {"✅ Connected" if vc_connected else "❌ Disconnected"}
@@ -86,7 +86,7 @@ Playback: {"✅ Running" if playback_alive else "❌ Dead"}
 Queue: {queue_size} frames
 VAD Threshold: {VAD_RMS_THRESHOLD}
 {speaking}
-Chat History: {len(context.chat_history)}/50 messages
+Chat History: {len(context.chat.history)}/50 messages
 """
 
     await ctx.respond(status_msg, ephemeral=True)

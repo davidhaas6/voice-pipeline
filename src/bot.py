@@ -47,42 +47,58 @@ PLAYBACK_QUEUE_MAXSIZE = int(PLAYBACK_QUEUE_MAX_SECONDS * 1000 / DISCORD_FRAME_S
 
 
 @dataclass
+class VoiceState:
+    vc: discord.VoiceClient
+    sink: discord.sinks.WaveSink
+    stop_event: threading.Event
+
+
+@dataclass
+class TurnState:
+    user_audio_buffer: io.BytesIO = None
+    user_speaking: bool = False
+    last_voice_time: float = 0
+    interrupted_for_current_turn: bool = False
+
+
+@dataclass
+class PlaybackState:
+    queue: queue.Queue
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    thread: threading.Thread = None
+    generation: int = 0
+
+
+@dataclass
+class ChatState:
+    history: deque[dict[str, str]] = field(default_factory=lambda: deque(maxlen=50))
+
+
+@dataclass
 class ServerContext:
     guild_id: int
-    vc: discord.VoiceClient
-    audio_sink: discord.sinks.WaveSink
-    processing_task: asyncio.Task
-    playback_queue: queue.Queue
-    playback_thread: threading.Thread
-    stop_event: threading.Event
-    chat_history: deque[dict[str, str]]
-    # these two variables help associate the bot response with the user turn it was generated for
-    playback_lock: threading.Lock = field(default_factory=threading.Lock)
-    tts_generation: int = 0
-    user_audio_buffer: io.BytesIO = None
-    last_voice_time: float = 0
-    user_speaking: bool = False
-    interrupted_for_current_turn: bool = False
-    pipeline_lock: asyncio.Lock = None
-    tts: TTSManager = None
-
-    def __post_init__(self):
-        self.pipeline_lock = asyncio.Lock()
+    voice: VoiceState
+    turn: TurnState
+    playback: PlaybackState
+    chat: ChatState
+    processing_task: asyncio.Task = None
+    pipeline_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    tts: TTSManager = field(default_factory=TTSManager)
 
     async def cleanup(self):
         """Unified cleanup for this server context."""
         logger.info(f"Cleaning up context for guild {self.guild_id}")
-        self.stop_event.set()
+        self.voice.stop_event.set()
 
         # 1. Stop recording ASAP so the library's internal recv_audio thread exits
         # before we disconnect and close the socket.
         try:
             if (
-                self.vc
-                and self.vc.is_connected()
-                and getattr(self.vc, "recording", False)
+                self.voice.vc
+                and self.voice.vc.is_connected()
+                and getattr(self.voice.vc, "recording", False)
             ):
-                self.vc.stop_recording()
+                self.voice.vc.stop_recording()
         except Exception as e:
             if "Not currently recording" not in str(e):
                 logger.error(
@@ -99,9 +115,9 @@ class ServerContext:
             logger.error(f"Error stopping TTS for guild {self.guild_id}: {e}")
 
         # 3. Flush playback queue
-        while not self.playback_queue.empty():
+        while not self.playback.queue.empty():
             try:
-                self.playback_queue.get_nowait()
+                self.playback.queue.get_nowait()
             except queue.Empty:
                 break
 
@@ -109,13 +125,13 @@ class ServerContext:
         # We wait for the playback thread to exit its loop (so it doesn't try to send
         # to a closed socket) before we disconnect. timeout=0.5 is safe since it's
         # a 20ms loop that checks stop_event.
-        if self.playback_thread and self.playback_thread.is_alive():
-            await asyncio.to_thread(self.playback_thread.join, timeout=0.5)
+        if self.playback.thread and self.playback.thread.is_alive():
+            await asyncio.to_thread(self.playback.thread.join, timeout=0.5)
 
         # 5. Disconnect from voice
         try:
-            if self.vc and self.vc.is_connected():
-                await self.vc.disconnect()
+            if self.voice.vc and self.voice.vc.is_connected():
+                await self.voice.vc.disconnect()
         except Exception as e:
             logger.error(f"Error disconnecting from guild {self.guild_id}: {e}")
 
@@ -176,23 +192,19 @@ class DiscordVoiceBot(discord.Bot):
 
         context = ServerContext(
             guild_id=guild_id,
-            vc=vc,
-            audio_sink=sink,
-            processing_task=None,
-            playback_queue=playback_queue,
-            playback_thread=None,
-            stop_event=stop_event,
-            chat_history=deque(maxlen=50),
-            tts=TTSManager(),
+            voice=VoiceState(vc=vc, sink=sink, stop_event=stop_event),
+            turn=TurnState(),
+            playback=PlaybackState(queue=playback_queue),
+            chat=ChatState(),
         )
 
         context.processing_task = asyncio.create_task(
             self.continuous_audio_processing(context)
         )
-        context.playback_thread = threading.Thread(
+        context.playback.thread = threading.Thread(
             target=self.playback_worker, args=(context,), daemon=True
         )
-        context.playback_thread.start()
+        context.playback.thread.start()
 
         self.contexts[guild_id] = context
         await ctx.followup.send(
@@ -277,7 +289,7 @@ class DiscordVoiceBot(discord.Bot):
 
         def on_audio_chunk(chunk_np: np.ndarray):
             # Fast drop if invalidated (barge-in or newer bot utterance)
-            if my_gen != context.tts_generation:
+            if my_gen != context.playback.generation:
                 return
 
             # pocket_tts provides float32 mono at tts.sample_rate
@@ -295,8 +307,8 @@ class DiscordVoiceBot(discord.Bot):
             frame_size_bytes = frame_size_samples * CHANNELS * SAMPLE_WIDTH
             raw_bytes = stereo_data.tobytes()
 
-            with context.playback_lock:
-                if my_gen != context.tts_generation:
+            with context.playback.lock:
+                if my_gen != context.playback.generation:
                     return
                 for i in range(0, len(raw_bytes), frame_size_bytes):
                     frame = raw_bytes[i : i + frame_size_bytes]
@@ -304,11 +316,11 @@ class DiscordVoiceBot(discord.Bot):
                         frame += b"\x00" * (frame_size_bytes - len(frame))
                     while True:
                         try:
-                            context.playback_queue.put_nowait(frame)
+                            context.playback.queue.put_nowait(frame)
                             break
                         except queue.Full:
                             try:
-                                context.playback_queue.get_nowait()  # drop oldest frame - note this could cause skipping
+                                context.playback.queue.get_nowait()  # drop oldest frame - note this could cause skipping
                             except queue.Empty:
                                 break
 
@@ -327,15 +339,15 @@ class DiscordVoiceBot(discord.Bot):
 
                 if not transcript:
                     return
-                context.chat_history.append({"role": "user", "content": transcript})
+                context.chat.history.append({"role": "user", "content": transcript})
                 if not await self.decide_to_respond(transcript):
                     return
 
-                response_text = await self.generate_response_text(context.chat_history)
+                response_text = await self.generate_response_text(context.chat.history)
                 t2t_done = time.perf_counter()
                 logger.debug(f"T2T took {(t2t_done - stt_done) * 1000:.2f}ms")
 
-                context.chat_history.append(
+                context.chat.history.append(
                     {"role": "assistant", "content": response_text or "Silence"}
                 )
 
@@ -349,10 +361,10 @@ class DiscordVoiceBot(discord.Bot):
         """Continuously polls the sink for new audio and handles VAD"""
         logger.info(f"Started audio processing for guild {context.guild_id}")
 
-        while not context.stop_event.is_set():
+        while not context.voice.stop_event.is_set():
             await asyncio.sleep(0.1)
 
-            for user_id, audio in list(context.audio_sink.audio_data.items()):
+            for user_id, audio in list(context.voice.sink.audio_data.items()):
                 audio.file.seek(0)
                 data = audio.file.read()
                 if not data:
@@ -365,41 +377,41 @@ class DiscordVoiceBot(discord.Bot):
 
                 threshold = (
                     VAD_RMS_CONTINUE_THRESHOLD
-                    if context.user_speaking
+                    if context.turn.user_speaking
                     else VAD_RMS_THRESHOLD
                 )
                 if rms > threshold:
-                    if not context.user_speaking:
+                    if not context.turn.user_speaking:
                         logger.info("User started speaking...")
-                        context.user_speaking = True
-                        context.user_audio_buffer = io.BytesIO()
-                        context.interrupted_for_current_turn = (
+                        context.turn.user_speaking = True
+                        context.turn.user_audio_buffer = io.BytesIO()
+                        context.turn.interrupted_for_current_turn = (
                             False  # reset for this turn
                         )
 
-                    context.user_audio_buffer.write(data)
-                    context.last_voice_time = time.time()
+                    context.turn.user_audio_buffer.write(data)
+                    context.turn.last_voice_time = time.time()
 
                     if (
-                        not context.interrupted_for_current_turn
-                        and context.user_audio_buffer.tell() >= MIN_TURN_BYTES
+                        not context.turn.interrupted_for_current_turn
+                        and context.turn.user_audio_buffer.tell() >= MIN_TURN_BYTES
                     ):
                         logger.info("Sustained speech detected. Interrupting bot.")
-                        context.interrupted_for_current_turn = True
+                        context.turn.interrupted_for_current_turn = True
                         self._invalidate_playback(context, flush_queue=True)
 
-            if context.user_speaking:
+            if context.turn.user_speaking:
                 # Check if silence duration has passed
-                if time.time() - context.last_voice_time > SILENCE_DURATION:
-                    audio_data = context.user_audio_buffer.getvalue()
-                    context.user_speaking = False
-                    context.interrupted_for_current_turn = False  # reset
+                if time.time() - context.turn.last_voice_time > SILENCE_DURATION:
+                    audio_data = context.turn.user_audio_buffer.getvalue()
+                    context.turn.user_speaking = False
+                    context.turn.interrupted_for_current_turn = False  # reset
 
                     if len(audio_data) < MIN_TURN_BYTES:
                         logger.info(
                             f"Dropping short utterance ({len(audio_data)} bytes)."
                         )
-                        context.user_audio_buffer = None
+                        context.turn.user_audio_buffer = None
                         continue
 
                     # Consider using to_mono_16k_wav for better optimization.
@@ -410,24 +422,24 @@ class DiscordVoiceBot(discord.Bot):
 
                     logger.info("User finished speaking. Triggering pipeline...")
                     asyncio.create_task(self.run_pipeline(context, wav_data))
-                    context.user_audio_buffer = None
+                    context.turn.user_audio_buffer = None
 
     # --- PLAYBACK ---
     def _invalidate_playback(self, context: ServerContext, *, flush_queue: bool = True):
         """
         Invalidates any in-flight TTS callbacks and optionally flushes queued audio frames.
         """
-        with context.playback_lock:
-            context.tts_generation += 1
+        with context.playback.lock:
+            context.playback.generation += 1
             try:
                 context.tts.stop()
             except Exception:
                 pass
 
             if flush_queue:
-                while not context.playback_queue.empty():
+                while not context.playback.queue.empty():
                     try:
-                        context.playback_queue.get_nowait()
+                        context.playback.queue.get_nowait()
                     except queue.Empty:
                         break
 
@@ -438,15 +450,15 @@ class DiscordVoiceBot(discord.Bot):
         Starts a new epoch for a fresh bot utterance.
         By default we don't flush the queue here (optional).
         """
-        with context.playback_lock:
-            context.tts_generation += 1
+        with context.playback.lock:
+            context.playback.generation += 1
             if flush_queue:
-                while not context.playback_queue.empty():
+                while not context.playback.queue.empty():
                     try:
-                        context.playback_queue.get_nowait()
+                        context.playback.queue.get_nowait()
                     except queue.Empty:
                         break
-            return context.tts_generation
+            return context.playback.generation
 
     def playback_worker(self, context: ServerContext):
         logger.info(f"Playback worker started for guild {context.guild_id}")
@@ -454,9 +466,9 @@ class DiscordVoiceBot(discord.Bot):
         TARGET_INTERVAL = DISCORD_FRAME_SIZE_MS / 1000.0
         next_frame_time = time.perf_counter()
 
-        while not context.stop_event.is_set():
+        while not context.voice.stop_event.is_set():
             # If we got disconnected, bail fast
-            if not context.vc or not context.vc.is_connected():
+            if not context.voice.vc or not context.voice.vc.is_connected():
                 break
 
             now = time.perf_counter()
@@ -467,13 +479,13 @@ class DiscordVoiceBot(discord.Bot):
 
             sent = False
             try:
-                frame = context.playback_queue.get_nowait()
+                frame = context.playback.queue.get_nowait()
             except queue.Empty:
                 frame = None
 
             if frame is not None:
                 try:
-                    context.vc.send_audio_packet(frame, encode=True)
+                    context.voice.vc.send_audio_packet(frame, encode=True)
                     sent = True
                 except OSError:
                     logger.warning(
@@ -498,7 +510,7 @@ class DiscordVoiceBot(discord.Bot):
                 remaining = next_frame_time - now
                 if remaining <= 0:
                     break
-                if context.stop_event.is_set():
+                if context.voice.stop_event.is_set():
                     return
                 if remaining > 0.005:
                     time.sleep(remaining - 0.003)
