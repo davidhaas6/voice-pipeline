@@ -5,13 +5,12 @@ import queue
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import discord
 import numpy as np
 from dotenv import load_dotenv
 from mistralai import Mistral
-from pydub import AudioSegment
 
 from src.audio_utils import resample_audio_poly
 
@@ -43,6 +42,9 @@ SAMPLE_WIDTH = 2  # 16-bit PCM
 MIN_TURN_SECONDS = 0.25  # timer for "is user actually talking, or is that a blip"
 MIN_TURN_BYTES = int(SAMPLING_RATE * CHANNELS * SAMPLE_WIDTH * MIN_TURN_SECONDS)
 
+PLAYBACK_QUEUE_MAX_SECONDS = 25.0
+PLAYBACK_QUEUE_MAXSIZE = int(PLAYBACK_QUEUE_MAX_SECONDS * 1000 / DISCORD_FRAME_SIZE_MS)
+
 
 @dataclass
 class ServerContext:
@@ -54,6 +56,9 @@ class ServerContext:
     playback_thread: threading.Thread
     stop_event: threading.Event
     chat_history: deque[dict[str, str]]
+    # these two variables help associate the bot response with the user turn it was generated for
+    playback_lock: threading.Lock = field(default_factory=threading.Lock)
+    tts_generation: int = 0
     user_audio_buffer: io.BytesIO = None
     last_voice_time: float = 0
     user_speaking: bool = False
@@ -69,7 +74,7 @@ class DiscordVoiceBot(discord.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.contexts: dict[int, ServerContext] = {}
-        self.system_prompt = """You are **Sponge**, a chill uncensored chatbot speaking with your friends in a Discord voice channel. Keep replies short: 1-2 sentences. Use plain words and contractions. No emojis, no bullet points, no special characters. Avoid formatting. No moralizing, lecturing, or over-explaining. Don't be corny or too serious. This will be read aloud, so output natural dialogue.\nThis is a group chat, so don't reply to everything. Infer if you are being directly addressed. If you are not addressed, just output the string 'Silence'. Quality over quantity.""".strip()
+        self.system_prompt = """You are **Sponge**, a chill uncensored chatbot speaking with your friends in a Discord voice channel. Keep replies short: a few words or a sentence. Use plain words and contractions. No emojis, no bullet points, no special characters. Avoid formatting. No moralizing, lecturing, or over-explaining. Don't be corny or too serious. If asked to speak in a language with a different alphabet, respond in phonetic English spelling of your response (e.g. "Ni hao" instead of "你好"). This will be read aloud, so output natural dialogue.\nThis is a group chat, so don't reply to everything. Infer if you are being directly addressed. If you are not addressed, just output the string 'Silence'. Quality over quantity.""".strip()
 
     # --- MODEL COMPONENTS ---
 
@@ -83,6 +88,7 @@ class DiscordVoiceBot(discord.Bot):
                     "file_name": "audio.wav",
                     "content": audio_data,
                 },
+                context_bias="Sponge,bot",
             )
             return transcription_response.text
         except Exception as e:
@@ -110,9 +116,7 @@ class DiscordVoiceBot(discord.Bot):
         )
         try:
             chat_response = await client.chat.complete_async(
-                model=T2T_MODEL,
-                messages=chat_context,
-                temperature=1.5,
+                model=T2T_MODEL, messages=chat_context, temperature=1, max_tokens=200
             )
         except Exception as e:
             logger.error(f"Error during T2T: {e}")
@@ -128,17 +132,18 @@ class DiscordVoiceBot(discord.Bot):
             return
         logger.debug(f'Requesting speech for: "{text[:20]}..."')
 
-        def on_audio_chunk(chunk_np: np.ndarray):
-            start_proc = time.perf_counter()
-            # pocket_tts provides float32 mono at tts.sample_rate
-            # Resample to 48000
-            resampled = resample_audio_poly(chunk_np, context.tts.sample_rate, 48000)
+        my_gen = self._new_speak_epoch(context, flush_queue=True)
 
-            # Normalize and convert to int16
+        def on_audio_chunk(chunk_np: np.ndarray):
+            # Fast drop if invalidated (barge-in or newer bot utterance)
+            if my_gen != context.tts_generation:
+                return
+
+            # pocket_tts provides float32 mono at tts.sample_rate
+            resampled = resample_audio_poly(chunk_np, context.tts.sample_rate, 48000)
             resampled = np.clip(resampled, -1.0, 1.0)
             int16_data = (resampled * 32767).astype(np.int16)
 
-            # Mono to Stereo (duplicate channels)
             stereo_data = np.repeat(int16_data[:, np.newaxis], 2, axis=1).flatten()
 
             # Enqueue in 20ms frames
@@ -147,21 +152,24 @@ class DiscordVoiceBot(discord.Bot):
             # Total 3840 bytes per 20ms frame
             frame_size_samples = int(48000 * (DISCORD_FRAME_SIZE_MS / 1000))
             frame_size_bytes = frame_size_samples * CHANNELS * SAMPLE_WIDTH
-
             raw_bytes = stereo_data.tobytes()
-            frames_enqueued = 0  # for performance logging
-            for i in range(0, len(raw_bytes), frame_size_bytes):
-                frame = raw_bytes[i : i + frame_size_bytes]
-                if len(frame) < frame_size_bytes:
-                    frame += b"\x00" * (frame_size_bytes - len(frame))
-                context.playback_queue.put(frame)
-                frames_enqueued += 1
 
-            # for performance logging
-            proc_time = (time.perf_counter() - start_proc) * 1000
-            # logger.debug(
-            #     f"Processed chunk: {len(chunk_np)} samples -> {frames_enqueued} frames in {proc_time:.2f}ms"
-            # )
+            with context.playback_lock:
+                if my_gen != context.tts_generation:
+                    return
+                for i in range(0, len(raw_bytes), frame_size_bytes):
+                    frame = raw_bytes[i : i + frame_size_bytes]
+                    if len(frame) < frame_size_bytes:
+                        frame += b"\x00" * (frame_size_bytes - len(frame))
+                    while True:
+                        try:
+                            context.playback_queue.put_nowait(frame)
+                            break
+                        except queue.Full:
+                            try:
+                                context.playback_queue.get_nowait()  # drop oldest frame - note this could cause skipping
+                            except queue.Empty:
+                                break
 
         context.tts.speak(text, callback=on_audio_chunk)
 
@@ -237,12 +245,7 @@ class DiscordVoiceBot(discord.Bot):
                     ):
                         logger.info("Sustained speech detected. Interrupting bot.")
                         context.interrupted_for_current_turn = True
-                        context.tts.stop()
-                        while not context.playback_queue.empty():
-                            try:
-                                context.playback_queue.get_nowait()
-                            except queue.Empty:
-                                break
+                        self._invalidate_playback(context, flush_queue=True)
 
             if context.user_speaking:
                 # Check if silence duration has passed
@@ -269,27 +272,40 @@ class DiscordVoiceBot(discord.Bot):
                     context.user_audio_buffer = None
 
     # --- PLAYBACK ---
+    def _invalidate_playback(self, context: ServerContext, *, flush_queue: bool = True):
+        """
+        Invalidates any in-flight TTS callbacks and optionally flushes queued audio frames.
+        """
+        with context.playback_lock:
+            context.tts_generation += 1
+            try:
+                context.tts.stop()
+            except Exception:
+                pass
 
-    def enqueue_audio_for_playback(self, context: ServerContext, audio_data: bytes):
-        """Splits audio into 20ms frames and adds them to the playback queue."""
-        # Convert to Discord format: 48kHz, 16-bit, stereo
-        # (Assuming the TTS output might need conversion)
-        try:
-            seg = AudioSegment.from_file(io.BytesIO(audio_data))
-            seg = seg.set_frame_rate(48000).set_channels(2).set_sample_width(2)
-            raw_data = seg.raw_data
+            if flush_queue:
+                while not context.playback_queue.empty():
+                    try:
+                        context.playback_queue.get_nowait()
+                    except queue.Empty:
+                        break
 
-            frame_size = (
-                int(48000 * (DISCORD_FRAME_SIZE_MS / 1000)) * CHANNELS * SAMPLE_WIDTH
-            )
-
-            for i in range(0, len(raw_data), frame_size):
-                frame = raw_data[i : i + frame_size]
-                if len(frame) < frame_size:
-                    frame += b"\x00" * (frame_size - len(frame))
-                context.playback_queue.put(frame)
-        except Exception as e:
-            logger.error(f"Error enqueuing audio: {e}")
+    def _new_speak_epoch(
+        self, context: ServerContext, *, flush_queue: bool = False
+    ) -> int:
+        """
+        Starts a new epoch for a fresh bot utterance.
+        By default we don't flush the queue here (optional).
+        """
+        with context.playback_lock:
+            context.tts_generation += 1
+            if flush_queue:
+                while not context.playback_queue.empty():
+                    try:
+                        context.playback_queue.get_nowait()
+                    except queue.Empty:
+                        break
+            return context.tts_generation
 
     def playback_worker(self, context: ServerContext):
         logger.info(f"Playback worker started for guild {context.guild_id}")

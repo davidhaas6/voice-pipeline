@@ -6,7 +6,12 @@ from collections import deque
 
 import discord
 
-from .bot import VAD_RMS_THRESHOLD, DiscordVoiceBot, ServerContext
+from .bot import (
+    PLAYBACK_QUEUE_MAXSIZE,
+    VAD_RMS_THRESHOLD,
+    DiscordVoiceBot,
+    ServerContext,
+)
 from .logger import get_logger
 from .tts import TTSManager
 
@@ -54,7 +59,7 @@ async def join(ctx: discord.ApplicationContext):
         )
 
     stop_event = threading.Event()
-    playback_queue = queue.Queue()
+    playback_queue = queue.Queue(maxsize=PLAYBACK_QUEUE_MAXSIZE)
 
     context = ServerContext(
         guild_id=guild_id,

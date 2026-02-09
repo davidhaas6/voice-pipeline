@@ -92,7 +92,7 @@ class TTSManager:
             state = self.voices[voice]
             self.stop_event.clear()
 
-            logger.info(f'Generating: "{text[:20]}{"..." if len(text) > 20 else ""}"')
+            logger.info(f'Generating: "{text}"')
             # all these are for performance logging
             start_time = time.perf_counter()
             first_chunk_time = None
