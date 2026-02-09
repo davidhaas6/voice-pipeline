@@ -243,17 +243,15 @@ class DiscordVoiceBot(discord.Bot):
                 },
                 context_bias=["sponge", "bot"],
             )
-            return transcription_response.text
+            transcript = transcription_response.text
+            logger.info(f"Transcript: {transcript}")
+            return transcript
         except Exception as e:
             logger.error(f"Transcription error: {e}")
             return ""
 
     async def decide_to_respond(self, transcript: str) -> bool:
         """Deciding if the bot should speak"""
-        logger.info(f"Should I respond to: '{transcript}'?")
-        # trigger_words = ["sponge", "bot", "bunch", "butt", "clanker"]
-        # decision = any(word in transcript.lower() for word in trigger_words)
-        # logger.info(f"Decision: {decision}")
         return True
 
     async def generate_response_text(self, chat_history: deque[dict[str, str]]) -> str:
@@ -279,11 +277,13 @@ class DiscordVoiceBot(discord.Bot):
 
     async def generate_response_audio(self, context: ServerContext, text: str):
         """Generates TTS audio and streams it to the playback queue."""
-        clean_text = text.strip().lower()
-        if not text or ("silence" in clean_text and len(clean_text) < 10):
-            logger.info("No text to speak.")
+        sanitized_text = text.strip().lower()
+        if not sanitized_text or (
+            "silence" in sanitized_text and len(sanitized_text) < 10
+        ):
+            logger.info("The bot remains silent.")
             return
-        logger.debug(f'Requesting speech for: "{text[:20]}..."')
+        logger.debug(f'Requesting speech for: "{text[:10]}..."')
 
         my_gen = self._new_speak_epoch(context, flush_queue=True)
 
